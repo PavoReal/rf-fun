@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
             },
             .flags = libusb_cflags,
         });
+        libusb_mod.linkFramework("CoreFoundation", .{});
         libusb_mod.linkFramework("IOKit", .{});
         libusb_mod.linkFramework("Security", .{});
     } else if (os_tag == .netbsd) {

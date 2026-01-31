@@ -34,7 +34,7 @@ const HackRF = struct {
         return hrf.hackrf_library_release();
     }
 
-    pub fn hackrf_device_list() ?*hrf.hackrf_device_list {
+    pub fn hackrf_device_list() ?*hrf.hackrf_device_list_t {
         return hrf.hackrf_device_list();
     }
 
@@ -62,6 +62,7 @@ test "hackrf device list" {
     try HackRF.init();
 
     const device_list = HackRF.hackrf_device_list();
+    _ = device_list;
 
     HackRF.deinit();
 }

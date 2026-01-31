@@ -8,22 +8,12 @@ const hrf = @cImport({
 const HackRF = struct {
     device: *hrf.hackrf_device,
 
-    pub fn init() !void {
-        if (hrf.hackrf_init() != hrf.HACKRF_SUCCESS) {
-            return error.HackRFInitFailed;
-        }
+    pub fn init() c_int {
+        return hrf.hackrf_init();
     }
-
-    pub fn open() !HackRF {
-        var device: ?*hrf.hackrf_device = null;
-
-        if (hrf.hackrf_open(&device) != hrf.HACKRF_SUCCESS) {
-            return error.HackRFOpenFailed;
-        }
-
-        std.debug.assert(device != null);
-
-        return .{ .device = device.? };
+    
+    pub fn deinit() c_int {
+        return hrf.hackrf_exit();
     }
 
     pub fn hackrf_library_version() ?[*:0]const u8 {
@@ -38,14 +28,17 @@ const HackRF = struct {
         return hrf.hackrf_device_list();
     }
 
-    pub fn deinit() void {
-        _ = hrf.hackrf_exit();
+    pub fn hackrf_device_list_free(list: *hrf.hackrf_device_list_t) void {
+        hrf.hackrf_device_list_free(list);
     }
 };
 
 test "hackrf library init" {
-    try HackRF.init();
-    HackRF.deinit();
+    const init_status = HackRF.init();
+    std.testing.expect(init_status == hrf.HACKRF_SUCCESS);
+
+    const exit_status = HackRF.deinit();
+    std.testing.expect(exit_status == hrf.HACKRF_SUCCESS);
 }
 
 test "hackrf version" {
@@ -59,10 +52,18 @@ test "hackrf release" {
 }
 
 test "hackrf device list" {
-    try HackRF.init();
+    const init_status = HackRF.init();
+    std.testing.expect(init_status == hrf.HACKRF_SUCCESS);
 
-    const device_list = HackRF.hackrf_device_list();
-    _ = device_list;
+    const device_list = HackRF.hackrf_device_list().?;
+    defer HackRF.hackrf_device_list_free(device_list.native);
 
-    HackRF.deinit();
+    std.debug.print("libhackrf device list contains {d} entries\n", .{device_list.devicecount});
+
+    for (0..device_list.devicecount) |i| {
+        std.debug.print("{d}: ", .{i});
+    }
+
+    const exit_status = HackRF.deinit();
+    std.testing.expect(exit_status == hrf.HACKRF_SUCCESS);
 }

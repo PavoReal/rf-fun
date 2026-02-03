@@ -1,44 +1,44 @@
 const std = @import("std");
-const Io = std.Io;
 
-const rf_fun = @import("rf_fun");
+const hackrf = @import("rf_fun");
 
-pub fn main(init: std.process.Init) !void {
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+fn ghz(val: comptime_float) comptime_int {
+    return @intFromFloat(val * 1e9);
+}
 
-    const arena: std.mem.Allocator = init.arena.allocator();
+fn mhz(val: comptime_float) comptime_int {
+    return @intFromFloat(val * 1e6);
+}
 
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+fn khz(val: comptime_float) comptime_int {
+    return @intFromFloat(val * 1e3);
+}
+
+pub fn main() !void {
+    try hackrf.init();
+    defer hackrf.deinit() catch {};
+
+    var list = try hackrf.DeviceList.get();
+    defer list.deinit();
+
+    if (list.count() == 0) {
+        std.log.err("Failed to find hackrf device", .{});
+        return;
     }
 
-    const io = init.io;
+    const device = try hackrf.Device.open();
+    defer device.close();
 
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    var version_buf: [256]u8 = undefined;
+    const version = try device.versionStringRead(&version_buf);
 
-    try rf_fun.printAnotherMessage(stdout_writer);
+    std.log.debug("Found hackrf device running firmware {s}", .{version});
 
-    try stdout_writer.flush();
-}
+    // Config hackrf
+    device.stopTx() catch {};
+    try device.setSampleRate(mhz(10));
+    try device.setFreq(ghz(0.9));
+    try device.setAmpEnable(true);
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa);
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+    std.log.debug("hackrf config done", .{});
 }

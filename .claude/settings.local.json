@@ -10,7 +10,16 @@
       "Bash(gh api:*)",
       "Bash(..zig-cacheofe01751ca0f958a562643947ac5ac8fatest.exe)",
       "Bash(echo:*)",
-      "Bash(zig version:*)"
+      "Bash(zig version:*)",
+      "WebFetch(domain:bayme.sh)",
+      "WebFetch(domain:meshtastic.org)",
+      "Bash(ls:*)",
+      "Bash(meshtastic:*)",
+      "Bash(pwsh -File configure_baymesh.ps1 -PrivacyMode High -NoBackup)",
+      "Bash(python:*)",
+      "Bash(findstr:*)",
+      "Bash(..zig-cacheo393c7ce7ac2dcb20074bd2511b8544eftest.exe)",
+      "Bash(cmd /c \".zig-cache\\\\o\\\\393c7ce7ac2dcb20074bd2511b8544ef\\\\test.exe\")"
     ]
   }
 }

@@ -40,10 +40,6 @@
             .url = "https://github.com/libusb/libusb/archive/refs/tags/v1.0.27.tar.gz",
             .hash = "N-V-__8AAGSMGgDb5aXYKy35qSci9DNnFT7K51Y6qzdhG82Z",
         },
-        .sdl = .{
-            .url = "https://github.com/allyourcodebase/SDL3/archive/refs/heads/zig-0.16.0.zip",
-            .hash = "sdl-0.0.0-i4QD0QKEqQChL_51aUvvTEm-qtHDfuCI7IWWBsKj3Rx4",
-        },
     },
     .paths = .{
         "build.zig",

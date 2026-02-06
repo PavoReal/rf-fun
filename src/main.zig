@@ -1,7 +1,4 @@
 const std = @import("std");
-const sdl = @cImport({
-    @cInclude("SDL3/SDL.h");
-});
 const hackrf = @import("rf_fun");
 
 fn ghz(val: comptime_float) comptime_int {
@@ -17,10 +14,6 @@ fn khz(val: comptime_float) comptime_int {
 }
 
 pub fn main() !void {
-    if (!sdl.SDL_Init(sdl.SDL_INIT_VIDEO)) {
-        std.debug.panic("SDL_Init failed: {s}\n", .{sdl.SDL_GetError()});
-    }
-    defer sdl.SDL_Quit();
 
     try hackrf.init();
     defer hackrf.deinit() catch {};

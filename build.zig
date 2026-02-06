@@ -162,15 +162,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
         .root_module = libhackrf_mod,
     });
-
-    //
-    // SDL3
-    //
-    const sdl = b.dependency("sdl", .{
-        .optimize = optimize,
-        .target = target,
-    });
-
+    
     //
     // root module
     //
@@ -202,7 +194,6 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkLibrary(libhackrf);
     exe.root_module.addIncludePath(hackrf_dep.path("host/libhackrf/src"));
 
-    exe.root_module.linkLibrary(sdl.artifact("SDL3"));
     b.installArtifact(exe);
 
     //

@@ -9,9 +9,6 @@ following web pages before writing or reading any zig code:
 - Language reference: https://ziglang.org/documentation/master/
 - std lib reference: https://ziglang.org/documentation/master/std/
 
-### Reference Files
-- ref/hackrf.h: Is a reference c header for hackrf library. 
-
 ## Claude's Workflow
 1. Start every complex task in plan mode. Pour your energy into the plan so
    you can 1-shot the implementation. Once you've written a plan, then spin

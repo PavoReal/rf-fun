@@ -2,6 +2,10 @@ const std = @import("std");
 const hackrf = @import("rf_fun");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 
+const rl = @cImport({
+    @cInclude("raylib.h");
+});
+
 fn ghz(val: comptime_float) comptime_int {
     return @intFromFloat(val * 1e9);
 }
@@ -58,13 +62,9 @@ pub fn main(init: std.process.Init) !void {
 
     const alloc = allocator.allocator();
 
-    var stdin_buf: [4096]u8 = undefined;
     var stdout_buf: [4096]u8 = undefined;
-
-    var stdin_rdr = std.Io.File.stdin().reader(io, &stdin_buf);
     var stdout_wtr = std.Io.File.stdout().writer(io, &stdout_buf);
 
-    const stdin = &stdin_rdr.interface;
     const stdout = &stdout_wtr.interface;
 
     // For dev cycle, clear stdout. Good with
@@ -103,18 +103,31 @@ pub fn main(init: std.process.Init) !void {
 
     try device.startRx(*CallbackState, rxCallback, &rx_state);
 
-    // Stall 
-    std.log.info("Press q<Enter> to exit", .{});
-    while (stdin.takeDelimiterExclusive('\n')) |line| {
-        stdin.toss(1); // toss the delimiter
+    const screen_width = 800;
+    const screen_height = 450;
 
-        if (std.mem.eql(u8, line, "q")) {
-            break;
-        }
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        error.StreamTooLong => return err,
-        error.ReadFailed => return err,
+    rl.InitWindow(screen_width, screen_height, "raylib [zig] - hello world");
+    defer rl.CloseWindow();
+    rl.SetTargetFPS(60);
+
+    while (!rl.WindowShouldClose()) {
+        rl.BeginDrawing();
+        defer rl.EndDrawing();
+
+        rl.ClearBackground(rl.RAYWHITE);
+
+        // Draw some rectangles
+        rl.DrawRectangle(100, 80, 200, 120, rl.LIGHTGRAY);
+        rl.DrawRectangle(150, 100, 200, 120, rl.BLUE);
+        rl.DrawRectangleLines(400, 80, 180, 140, rl.DARKGREEN);
+        rl.DrawRectangle(500, 200, 100, 80, rl.RED);
+        rl.DrawRectangle(50, 300, 300, 60, rl.ORANGE);
+
+        // Draw some text
+        rl.DrawText("Hello, Raylib + Zig!", 220, 20, 30, rl.DARKGRAY);
+        rl.DrawText("This is a rectangle party.", 260, 360, 20, rl.MAROON);
+
+        rl.DrawFPS(10, 10);
     }
 
     rx_state.should_stop = true;

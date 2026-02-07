@@ -28,15 +28,14 @@ fn gb(val: comptime_float) comptime_int {
 const CallbackState = struct {
     should_stop: bool = true,
     bytes_transfered: u64 = 0,
+    stdout_wtr: *std.Io.Writer
 };
 
 fn rxCallback(trans: hackrf.Transfer, state: *CallbackState) hackrf.StreamAction {
     const valid_length = trans.validLength();
+    state.bytes_transfered += valid_length;
 
-    std.log.debug("Ready with {d} Mb", .{valid_length / 1000});
-    state.bytes_transfered += trans.validLength();
-
-    // I need to get array of datatypes out
+    std.log.debug("(rxCallback) received {d} KB", .{valid_length / 1000});
 
     if (state.should_stop) return .stop;
     return .@"continue";
@@ -86,15 +85,16 @@ pub fn main(init: std.process.Init) !void {
     
     std.log.debug("hackrf config done", .{});
 
-    var rx_state = CallbackState{};
+    var rx_state = CallbackState{.stdout_wtr = stdout, .should_stop = false};
+
     try device.startRx(*CallbackState, rxCallback, &rx_state);
+
 
     std.log.info("Press q<Enter> to exit", .{});
     while (stdin.takeDelimiterExclusive('\n')) |line| {
         stdin.toss(1); // toss the delimiter
 
         if (std.mem.eql(u8, line, "q")) {
-
             break;
         }
     } else |err| switch (err) {
@@ -102,5 +102,7 @@ pub fn main(init: std.process.Init) !void {
         error.StreamTooLong => return err,
         error.ReadFailed => return err,
     }
+
+    rx_state.should_stop = true;
 }
 

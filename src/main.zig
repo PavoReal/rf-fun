@@ -1,6 +1,10 @@
 const std = @import("std");
 const hackrf = @import("rf_fun");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
+const fftw = @cImport({
+    @cDefine("__float128", "double");
+    @cInclude("fftw3.h");
+});
 
 const rl = @cImport({
     @cInclude("raylib.h");
@@ -110,6 +114,35 @@ pub fn main(init: std.process.Init) !void {
     try stdout.writeAll("\x1B[2J\x1B[3J\x1B[H");
     try stdout.flush();
 
+    std.log.debug("Starting FFT", .{});
+    const N = 8;
+
+    const in: *[N]fftw.fftw_complex = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * N)));
+    defer fftw.fftw_free(in);
+
+    const out: *[N]fftw.fftw_complex = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * N)));
+    defer fftw.fftw_free(out);
+
+    const plan = fftw.fftw_plan_dft_1d(N, in, out, fftw.FFTW_FORWARD, fftw.FFTW_ESTIMATE);
+    defer fftw.fftw_destroy_plan(plan);
+
+    // Set up a simple impulse: 1 + 0i at index 0, rest zeros
+    for (0..N) |i| {
+        in[i][0] = 0.0; // real
+        in[i][1] = 0.0; // imag
+    }
+    in[0][0] = 1.0; // DC impulse
+
+    fftw.fftw_execute(plan);
+
+    // FFT of an impulse should be all 1s
+    std.debug.print("FFT output:\n", .{});
+
+    for (0..N) |i| {
+        std.debug.print("  [{d}] {d:.4} + {d:.4}i\n", .{ i, out[i][0], out[i][1] });
+    }
+    std.log.debug("FFT Done", .{});
+
     try hackrf.init();
     defer hackrf.deinit() catch {};
 
@@ -130,8 +163,8 @@ pub fn main(init: std.process.Init) !void {
     std.log.debug("Found hackrf device running firmware {s}", .{version});
 
     device.stopTx() catch {};
-    try device.setSampleRate(mhz(20));
-    try device.setFreq(ghz(0.9));
+    try device.setSampleRate(mhz(1));
+    try device.setFreq(ghz(2.4));
     try device.setAmpEnable(true);
 
     std.log.debug("hackrf config done", .{});
@@ -216,4 +249,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     rx_state.should_stop = true;
+}
+
+test "fftw" {
+
 }

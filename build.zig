@@ -162,7 +162,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
         .root_module = libhackrf_mod,
     });
-    
+
     //
     // Build raylib from source (uses fork's Zig 0.16-compatible build.zig)
     //
@@ -197,6 +197,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "rf_fun", .module = mod },
             },
+            .link_libc = true
         }),
     });
 
@@ -205,6 +206,15 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.linkLibrary(raylib);
     exe.root_module.addIncludePath(raylib_dep.path("src"));
+
+    if (os_tag == .windows) {
+        exe.root_module.addIncludePath(b.path("deps/fftw-3.3.5-dll64"));
+        exe.root_module.addLibraryPath(b.path("deps/fftw-3.3.5-dll64"));
+        b.installBinFile("deps/fftw-3.3.5-dll64/libfftw3-3.dll", "libfftw3-3.dll");
+    }
+
+    exe.root_module.linkSystemLibrary("libfftw3-3", .{.needed = true});
+
 
     b.installArtifact(exe);
 
@@ -218,6 +228,10 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     run_cmd.step.dependOn(b.getInstallStep());
+
+    if (os_tag == .windows) {
+        run_cmd.setCwd(b.path("zig-out/bin"));
+    }
 
     if (b.args) |args| {
         run_cmd.addArgs(args);

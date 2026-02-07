@@ -53,6 +53,7 @@ config: Config,
 series: [max_series]Series = undefined,
 series_count: usize = 0,
 series_visible: [max_series]bool = .{true} ** max_series,
+user_view: bool = false,
 
 // View ranges (zoom/pan state)
 view_x: [2]f32,
@@ -125,6 +126,20 @@ pub fn update(self: *Plot) void {
         legend_clicked = self.handleLegendClick(mx, my);
     }
 
+    // Reset button click
+    var reset_clicked = false;
+    if (self.user_view and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
+        const btn = self.resetButtonRect();
+        if (mx >= btn.x and mx <= btn.x + btn.width and
+            my >= btn.y and my <= btn.y + btn.height)
+        {
+            self.view_x = self.orig_x;
+            self.view_y = self.orig_y;
+            self.user_view = false;
+            reset_clicked = true;
+        }
+    }
+
     // Zoom with mouse wheel
     if (in_rect) {
         const wheel = rl.GetMouseWheelMove();
@@ -143,12 +158,14 @@ pub fn update(self: *Plot) void {
 
             self.view_x = .{ cx - half_w, cx + half_w };
             self.view_y = .{ cy - half_h, cy + half_h };
+            self.user_view = true;
         }
     }
 
-    // Pan with click-drag (suppress if legend was clicked)
-    if (in_rect and !legend_clicked and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
+    // Pan with click-drag (suppress if legend or reset button was clicked)
+    if (in_rect and !legend_clicked and !reset_clicked and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
         self.dragging = true;
+        self.user_view = true;
         self.drag_start = .{ .x = mx, .y = my };
         self.drag_view_x_start = self.view_x;
         self.drag_view_y_start = self.view_y;
@@ -179,6 +196,7 @@ pub fn update(self: *Plot) void {
     if (in_rect and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_RIGHT)) {
         self.view_x = self.orig_x;
         self.view_y = self.orig_y;
+        self.user_view = false;
     }
 }
 
@@ -266,8 +284,50 @@ pub fn render(self: *Plot) void {
         self.drawLegend();
     }
 
+    // Reset view button (only when zoomed/panned)
+    if (self.user_view) {
+        self.drawResetButton();
+    }
+
     // Cursor readout
     self.drawCursor();
+}
+
+// ── Internal: reset button ───────────────────────────────
+
+fn resetButtonRect(self: *const Plot) rl.Rectangle {
+    const r = self.config.rect;
+    const btn_w: f32 = 54;
+    const btn_h: f32 = 22;
+    return .{
+        .x = r.x + r.width - btn_w - 6,
+        .y = r.y + 6,
+        .width = btn_w,
+        .height = btn_h,
+    };
+}
+
+fn drawResetButton(self: *const Plot) void {
+    const btn = self.resetButtonRect();
+    const mx = @as(f32, @floatFromInt(rl.GetMouseX()));
+    const my = @as(f32, @floatFromInt(rl.GetMouseY()));
+    const hovered = mx >= btn.x and mx <= btn.x + btn.width and
+        my >= btn.y and my <= btn.y + btn.height;
+
+    const bg = if (hovered)
+        rl.Color{ .r = 220, .g = 220, .b = 220, .a = 240 }
+    else
+        rl.Color{ .r = 245, .g = 245, .b = 245, .a = 220 };
+
+    rl.DrawRectangleRec(btn, bg);
+    rl.DrawRectangleLinesEx(btn, 1, legend_border);
+    rl.DrawText(
+        "Reset",
+        @intFromFloat(btn.x + 10),
+        @intFromFloat(btn.y + 4),
+        13,
+        dark_text,
+    );
 }
 
 // ── Internal: coordinate mapping ─────────────────────────
@@ -688,6 +748,7 @@ fn drawCursor(self: *Plot) void {
 // ── Internal: auto-scale ─────────────────────────────────
 
 fn autoScale(self: *Plot) void {
+    if (self.user_view) return;
     if (self.series_count == 0) return;
 
     const auto_x = self.config.x_range == null;

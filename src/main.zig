@@ -1,6 +1,7 @@
 const std = @import("std");
 const hackrf = @import("rf_fun");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
+
 const fftw = @cImport({
     @cDefine("__float128", "double");
     @cInclude("fftw3.h");
@@ -32,6 +33,8 @@ fn mb(val: comptime_float) comptime_int {
 fn gb(val: comptime_float) comptime_int {
     return @intFromFloat(val * 1e9);
 }
+
+const FFT_SIZE = 1024;
 
 const CallbackState = struct {
     mutex: std.Io.Mutex = .init,
@@ -65,44 +68,27 @@ pub fn main(init: std.process.Init) !void {
 
     const alloc = allocator.allocator();
 
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_wtr = std.Io.File.stdout().writer(io, &stdout_buf);
+    // Allocate FFTW buffers for real-time FFT
+    const fft_in: *[FFT_SIZE]fftw.fftw_complex = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * FFT_SIZE)));
+    defer fftw.fftw_free(fft_in);
 
-    const stdout = &stdout_wtr.interface;
+    const fft_out: *[FFT_SIZE]fftw.fftw_complex = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * FFT_SIZE)));
+    defer fftw.fftw_free(fft_out);
 
-    // For dev cycle, clear stdout. Good with
-    // zig build run --watch
-    try stdout.writeAll("\x1B[2J\x1B[3J\x1B[H");
-    try stdout.flush();
+    const fft_plan = fftw.fftw_plan_dft_1d(FFT_SIZE, fft_in, fft_out, fftw.FFTW_FORWARD, fftw.FFTW_ESTIMATE);
+    defer fftw.fftw_destroy_plan(fft_plan);
 
-    std.log.debug("Starting FFT", .{});
-    const N = 8;
+    // Magnitude (dB) and frequency axis buffers
+    const fft_mag: []f32 = try alloc.alloc(f32, FFT_SIZE);
+    const fft_freqs: []f32 = try alloc.alloc(f32, FFT_SIZE);
 
-    const in: *[N]fftw.fftw_complex = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * N)));
-    defer fftw.fftw_free(in);
-
-    const out: *[N]fftw.fftw_complex = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * N)));
-    defer fftw.fftw_free(out);
-
-    const plan = fftw.fftw_plan_dft_1d(N, in, out, fftw.FFTW_FORWARD, fftw.FFTW_ESTIMATE);
-    defer fftw.fftw_destroy_plan(plan);
-
-    // Set up a simple impulse: 1 + 0i at index 0, rest zeros
-    for (0..N) |i| {
-        in[i][0] = 0.0; // real
-        in[i][1] = 0.0; // imag
+    // Pre-compute frequency axis (MHz) — fftshift so DC is in the center
+    const center_freq_mhz: f32 = 900.0;
+    const sample_rate_mhz: f32 = 1.0;
+    for (0..FFT_SIZE) |i| {
+        const bin: f32 = @as(f32, @floatFromInt(i)) - @as(f32, FFT_SIZE) / 2.0;
+        fft_freqs[i] = center_freq_mhz + bin * sample_rate_mhz / @as(f32, FFT_SIZE);
     }
-    in[0][0] = 1.0; // DC impulse
-
-    fftw.fftw_execute(plan);
-
-    // FFT of an impulse should be all 1s
-    std.debug.print("FFT output:\n", .{});
-
-    for (0..N) |i| {
-        std.debug.print("  [{d}] {d:.4} + {d:.4}i\n", .{ i, out[i][0], out[i][1] });
-    }
-    std.log.debug("FFT Done", .{});
 
     try hackrf.init();
     defer hackrf.deinit() catch {};
@@ -124,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.debug("Found hackrf device running firmware {s}", .{version});
 
     device.stopTx() catch {};
-    try device.setSampleRate(mhz(1));
+    try device.setSampleRate(mhz(10));
     try device.setFreq(ghz(0.9));
     try device.setAmpEnable(true);
 
@@ -138,15 +124,15 @@ pub fn main(init: std.process.Init) !void {
     try device.startRx(*CallbackState, rxCallback, &rx_state);
 
     const screen_width = 800;
-    const screen_height = 450;
+    const screen_height = 700;
 
     rl.InitWindow(screen_width, screen_height, "rf-fun");
     defer rl.CloseWindow();
 
-    rl.SetTargetFPS(60);
+    rl.SetTargetFPS(2);
     const start_time: f64 = rl.GetTime();
 
-    const samples_to_show = screen_width;
+    const samples_to_show = FFT_SIZE;
     const samples: []hackrf.IQSample = try alloc.alloc(hackrf.IQSample, samples_to_show);
     defer alloc.free(samples);
 
@@ -156,17 +142,17 @@ pub fn main(init: std.process.Init) !void {
     const q_samples: []f32 = try alloc.alloc(f32, samples_to_show);
     defer alloc.free(q_samples);
 
-    var time_plot = Plot.init(.{
-        .title = "IQ Time Domain",
-        .x_label = "Sample",
-        .y_label = "Amp",
-        .rect = .{ .x = 10, .y = 50, .width = @as(f32, screen_width - 20), .height = @as(f32, screen_height - 80) },
-        .y_range = .{ -1.0, 1.0 },
+    var fft_plot = Plot.init(.{
+        .title = "FFT Spectrum",
+        .x_label = "Freq (MHz)",
+        .y_label = "dB",
+        .rect = .{ .x = 10, .y = 40, .width = @as(f32, screen_width - 20), .height = 512 },
+        .y_range = .{ -120.0, 0.0 },
     });
 
     while (!rl.WindowShouldClose()) {
         // Update (zoom/pan/cursor input)
-        time_plot.update();
+        fft_plot.update();
 
         // Copy sample data from ring buffer
         try rx_state.mutex.lock(io);
@@ -183,24 +169,37 @@ pub fn main(init: std.process.Init) !void {
         }
         rx_state.mutex.unlock(io);
 
-        // Convert IQ samples to float arrays
         for (samples, 0..) |s, i| {
             const f = s.toFloat();
             i_samples[i] = f[0];
             q_samples[i] = f[1];
         }
 
-        // Set data each frame
-        time_plot.clear();
-        time_plot.plotY(i_samples, .{ .color = rl.GREEN, .label = "I" });
-        time_plot.plotY(q_samples, .{ .color = rl.RED, .label = "Q" });
+        for (0..FFT_SIZE) |i| {
+            fft_in[i][0] = i_samples[i]; // real = I
+            fft_in[i][1] = q_samples[i]; // imag = Q
+        }
+        fftw.fftw_execute(fft_plan);
+
+        const half = FFT_SIZE / 2;
+        const n_sq: f64 = FFT_SIZE * FFT_SIZE;
+        for (0..FFT_SIZE) |i| {
+            const src = (i + half) % FFT_SIZE;
+            const re = fft_out[src][0];
+            const im = fft_out[src][1];
+            const power = (re * re + im * im) / n_sq;
+            fft_mag[i] = @floatCast(10.0 * @log10(@max(power, 1e-12)));
+        }
+
+        fft_plot.clear();
+        fft_plot.plotXY(fft_freqs, fft_mag, .{ .color = rl.SKYBLUE, .label = "Magnitude" });
 
         // Draw
         rl.BeginDrawing();
         defer rl.EndDrawing();
 
         rl.ClearBackground(.{ .r = 30, .g = 30, .b = 30, .a = 255 });
-        time_plot.render();
+        fft_plot.render();
 
         var rx_stat_str_buf = std.mem.zeroes([128]u8);
 
@@ -216,6 +215,3 @@ pub fn main(init: std.process.Init) !void {
     rx_state.should_stop = true;
 }
 
-test "fftw" {
-
-}

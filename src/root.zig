@@ -115,6 +115,30 @@ pub const StreamAction = enum {
     stop,
 };
 
+/// Interleaved signed 8-bit I/Q sample pair.
+/// The HackRF transfer buffer contains these as [I₁, Q₁, I₂, Q₂, ...].
+pub const IQSample = extern struct {
+    i: i8,
+    q: i8,
+
+    /// Normalize to f32 values in [-1.0, ~+0.992].
+    pub fn toFloat(self: IQSample) [2]f32 {
+        return .{
+            @as(f32, @floatFromInt(self.i)) / 128.0,
+            @as(f32, @floatFromInt(self.q)) / 128.0,
+        };
+    }
+
+    /// Create an IQSample from normalized f32 values in [-1.0, 1.0].
+    /// Values are clamped to the i8 range.
+    pub fn fromFloat(i_f: f32, q_f: f32) IQSample {
+        return .{
+            .i = @intFromFloat(std.math.clamp(i_f * 128.0, -128.0, 127.0)),
+            .q = @intFromFloat(std.math.clamp(q_f * 128.0, -128.0, 127.0)),
+        };
+    }
+};
+
 /// USB transfer information passed to RX or TX callback
 pub const Transfer = struct {
     inner: *c.hackrf_transfer,
@@ -131,6 +155,10 @@ pub const Transfer = struct {
         return self.inner.buffer[0..@intCast(self.inner.valid_length)];
     }
 
+    pub fn validLength(self: Transfer) u32 {
+        return @intCast(self.inner.valid_length);
+    }
+
     pub fn setValidLength(self: Transfer, len: usize) void {
         self.inner.valid_length = @intCast(len);
     }
@@ -141,6 +169,22 @@ pub const Transfer = struct {
 
     pub fn txContext(self: Transfer, comptime T: type) ?*T {
         return @ptrCast(@alignCast(self.inner.tx_ctx));
+    }
+
+    /// Reinterpret valid received data as IQ sample pairs (zero-copy).
+    pub fn iqSamples(self: Transfer) []IQSample {
+        return std.mem.bytesAsSlice(IQSample, self.validData());
+    }
+
+    /// Reinterpret the full transfer buffer as IQ sample pairs (zero-copy).
+    /// Use this in TX callbacks to fill the buffer with samples.
+    pub fn iqSamplesBuffer(self: Transfer) []IQSample {
+        return std.mem.bytesAsSlice(IQSample, self.buffer());
+    }
+
+    /// Reinterpret valid received data as signed 8-bit values (zero-copy).
+    pub fn signedData(self: Transfer) []i8 {
+        return std.mem.bytesAsSlice(i8, self.validData());
     }
 };
 
@@ -886,6 +930,70 @@ test "SweepStyle values" {
     // Verify enum integer values match expected C constants
     try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(SweepStyle.linear));
     try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(SweepStyle.interleaved));
+}
+
+// === IQSample Tests ===
+
+test "IQSample size and alignment" {
+    try std.testing.expectEqual(@as(usize, 2), @sizeOf(IQSample));
+    try std.testing.expectEqual(@as(usize, 1), @alignOf(IQSample));
+}
+
+test "IQSample field layout" {
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(IQSample, "i"));
+    try std.testing.expectEqual(@as(usize, 1), @offsetOf(IQSample, "q"));
+}
+
+test "IQSample toFloat" {
+    // Zero
+    const zero = (IQSample{ .i = 0, .q = 0 }).toFloat();
+    try std.testing.expectEqual(@as(f32, 0.0), zero[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), zero[1]);
+
+    // Max positive (127)
+    const pos = (IQSample{ .i = 127, .q = 127 }).toFloat();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9921875), pos[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9921875), pos[1], 0.001);
+
+    // Max negative (-128)
+    const neg = (IQSample{ .i = -128, .q = -128 }).toFloat();
+    try std.testing.expectEqual(@as(f32, -1.0), neg[0]);
+    try std.testing.expectEqual(@as(f32, -1.0), neg[1]);
+}
+
+test "IQSample fromFloat" {
+    // Roundtrip near zero
+    const sample = IQSample.fromFloat(0.5, -0.5);
+    try std.testing.expectEqual(@as(i8, 64), sample.i);
+    try std.testing.expectEqual(@as(i8, -64), sample.q);
+
+    // Clamping at boundaries
+    const clamped = IQSample.fromFloat(2.0, -2.0);
+    try std.testing.expectEqual(@as(i8, 127), clamped.i);
+    try std.testing.expectEqual(@as(i8, -128), clamped.q);
+}
+
+test "IQSample bytesAsSlice roundtrip" {
+    // Simulate a transfer buffer: I=10, Q=-20, I=30, Q=-40
+    var buf = [_]u8{ @as(u8, @bitCast(@as(i8, 10))), @as(u8, @bitCast(@as(i8, -20))), @as(u8, @bitCast(@as(i8, 30))), @as(u8, @bitCast(@as(i8, -40))) };
+    const samples = std.mem.bytesAsSlice(IQSample, &buf);
+
+    try std.testing.expectEqual(@as(usize, 2), samples.len);
+    try std.testing.expectEqual(@as(i8, 10), samples[0].i);
+    try std.testing.expectEqual(@as(i8, -20), samples[0].q);
+    try std.testing.expectEqual(@as(i8, 30), samples[1].i);
+    try std.testing.expectEqual(@as(i8, -40), samples[1].q);
+}
+
+test "signedData view" {
+    // Verify u8 -> i8 reinterpretation
+    var buf = [_]u8{ 0x00, 0x7F, 0x80, 0xFF };
+    const signed = std.mem.bytesAsSlice(i8, &buf);
+
+    try std.testing.expectEqual(@as(i8, 0), signed[0]);
+    try std.testing.expectEqual(@as(i8, 127), signed[1]);
+    try std.testing.expectEqual(@as(i8, -128), signed[2]);
+    try std.testing.expectEqual(@as(i8, -1), signed[3]);
 }
 
 // === Struct Layout Tests ===

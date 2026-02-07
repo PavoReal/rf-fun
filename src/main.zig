@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.debug("Found hackrf device running firmware {s}", .{version});
 
     device.stopTx() catch {};
-    try device.setSampleRate(mhz(1));
+    try device.setSampleRate(mhz(20));
     try device.setFreq(ghz(0.9));
     try device.setAmpEnable(true);
 
@@ -149,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
     rl.InitWindow(screen_width, screen_height, "rf-fun");
     defer rl.CloseWindow();
 
-    rl.SetTargetFPS(60);
+    rl.SetTargetFPS(240);
     const start_time: f64 = rl.GetTime();
 
     const samples_to_show = screen_width;
@@ -212,6 +212,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try std.fmt.bufPrint(&rx_stat_str_buf, "Received {d} MB @ {d:.2} MB/s", .{ rx_total_bytes / mb(1), (@as(f64, @floatFromInt(rx_total_bytes)) / elapsed_time) / mb(1) });
 
         rl.DrawText(&rx_stat_str_buf, 10, 10, 20, rl.MAROON);
+        rl.DrawFPS(screen_width - 100, 10);
     }
 
     rx_state.should_stop = true;

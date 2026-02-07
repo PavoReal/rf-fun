@@ -19,7 +19,8 @@
       "Bash(python:*)",
       "Bash(findstr:*)",
       "Bash(..zig-cacheo393c7ce7ac2dcb20074bd2511b8544eftest.exe)",
-      "Bash(cmd /c \".zig-cache\\\\o\\\\393c7ce7ac2dcb20074bd2511b8544ef\\\\test.exe\")"
+      "Bash(cmd /c \".zig-cache\\\\o\\\\393c7ce7ac2dcb20074bd2511b8544ef\\\\test.exe\")",
+      "Bash(zig test:*)"
     ]
   }
 }

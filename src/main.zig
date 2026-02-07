@@ -106,28 +106,30 @@ pub fn main(init: std.process.Init) !void {
     const screen_width = 800;
     const screen_height = 450;
 
-    rl.InitWindow(screen_width, screen_height, "raylib [zig] - hello world");
+    rl.InitWindow(screen_width, screen_height, "rf-fun");
     defer rl.CloseWindow();
+
     rl.SetTargetFPS(60);
+    const start_time: f64 = rl.GetTime();
 
     while (!rl.WindowShouldClose()) {
         rl.BeginDrawing();
         defer rl.EndDrawing();
 
-        rl.ClearBackground(rl.RAYWHITE);
+        rl.ClearBackground(rl.BLACK);
 
-        // Draw some rectangles
-        rl.DrawRectangle(100, 80, 200, 120, rl.LIGHTGRAY);
-        rl.DrawRectangle(150, 100, 200, 120, rl.BLUE);
-        rl.DrawRectangleLines(400, 80, 180, 140, rl.DARKGREEN);
-        rl.DrawRectangle(500, 200, 100, 80, rl.RED);
-        rl.DrawRectangle(50, 300, 300, 60, rl.ORANGE);
+        try rx_state.mutex.lock(io);
+        const rx_total_bytes = rx_state.bytes_transfered;
+        rx_state.mutex.unlock(io);
 
-        // Draw some text
-        rl.DrawText("Hello, Raylib + Zig!", 220, 20, 30, rl.DARKGRAY);
-        rl.DrawText("This is a rectangle party.", 260, 360, 20, rl.MAROON);
+        var rx_stat_str_buf = std.mem.zeroes([128]u8);
 
-        rl.DrawFPS(10, 10);
+        const current_time: f64 = rl.GetTime();
+        const elapsed_time = current_time - start_time;
+
+        _ = try std.fmt.bufPrint(&rx_stat_str_buf, "Received {d} MB @ {d:.2} MB/s", .{ rx_total_bytes / mb(1), (@as(f64, @floatFromInt(rx_total_bytes)) / elapsed_time) / mb(1) });
+
+        rl.DrawText(&rx_stat_str_buf, 10, 10, 20, rl.MAROON);
     }
 
     rx_state.should_stop = true;

@@ -6,9 +6,8 @@ const fftw = @cImport({
     @cInclude("fftw3.h");
 });
 
-const rl = @cImport({
-    @cInclude("raylib.h");
-});
+const Plot = @import("plot.zig");
+const rl = Plot.rl;
 
 fn ghz(val: comptime_float) comptime_int {
     return @intFromFloat(val * 1e9);
@@ -33,44 +32,6 @@ fn mb(val: comptime_float) comptime_int {
 fn gb(val: comptime_float) comptime_int {
     return @intFromFloat(val * 1e9);
 }
-
-const PlotSpace = struct {
-    // Screen rect (pixels)
-    x: c_int,
-    y: c_int,
-    width: c_int,
-    height: c_int,
-
-    // Data ranges (what the axes represent)
-    x_min: f32,
-    x_max: f32,
-    y_min: f32,
-    y_max: f32,
-
-    /// Map a data-space point to a screen-space Vector2.
-    fn map(self: PlotSpace, data_x: f32, data_y: f32) rl.Vector2 {
-        const sx = @as(f32, @floatFromInt(self.x)) +
-            (data_x - self.x_min) / (self.x_max - self.x_min) * @as(f32, @floatFromInt(self.width));
-        const sy = @as(f32, @floatFromInt(self.y + self.height)) -
-            (data_y - self.y_min) / (self.y_max - self.y_min) * @as(f32, @floatFromInt(self.height));
-        return .{ .x = sx, .y = sy };
-    }
-
-    /// Begin clipped drawing (call before drawing data).
-    fn beginClip(self: PlotSpace) void {
-        rl.BeginScissorMode(self.x, self.y, self.width, self.height);
-    }
-
-    /// End clipped drawing.
-    fn endClip() void {
-        rl.EndScissorMode();
-    }
-
-    /// Draw the plot background.
-    fn drawBg(self: PlotSpace, color: rl.Color) void {
-        rl.DrawRectangle(self.x, self.y, self.width, self.height, color);
-    }
-};
 
 const CallbackState = struct {
     mutex: std.Io.Mutex = .init,
@@ -164,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
 
     device.stopTx() catch {};
     try device.setSampleRate(mhz(1));
-    try device.setFreq(ghz(2.4));
+    try device.setFreq(ghz(0.9));
     try device.setAmpEnable(true);
 
     std.log.debug("hackrf config done", .{});
@@ -182,37 +143,32 @@ pub fn main(init: std.process.Init) !void {
     rl.InitWindow(screen_width, screen_height, "rf-fun");
     defer rl.CloseWindow();
 
-    rl.SetTargetFPS(240);
+    rl.SetTargetFPS(60);
     const start_time: f64 = rl.GetTime();
 
     const samples_to_show = screen_width;
     const samples: []hackrf.IQSample = try alloc.alloc(hackrf.IQSample, samples_to_show);
     defer alloc.free(samples);
 
-    const points: []rl.Vector2 = try alloc.alloc(rl.Vector2, samples_to_show);
-    defer alloc.free(points);
+    // Separate float buffers for I and Q channels
+    const i_samples: []f32 = try alloc.alloc(f32, samples_to_show);
+    defer alloc.free(i_samples);
+    const q_samples: []f32 = try alloc.alloc(f32, samples_to_show);
+    defer alloc.free(q_samples);
 
-    const top_height = 40;
-    const left_border = 10;
-
-    const plot = PlotSpace{
-        .x = left_border,
-        .y = top_height,
-        .width = screen_width - 20,
-        .height = screen_height - 50,
-        .x_min = 0,
-        .x_max = @floatFromInt(samples_to_show),
-        .y_min = -1,
-        .y_max = 1,
-    };
+    var time_plot = Plot.init(.{
+        .title = "IQ Time Domain",
+        .x_label = "Sample",
+        .y_label = "Amp",
+        .rect = .{ .x = 10, .y = 50, .width = @as(f32, screen_width - 20), .height = @as(f32, screen_height - 80) },
+        .y_range = .{ -1.0, 1.0 },
+    });
 
     while (!rl.WindowShouldClose()) {
-        rl.BeginDrawing();
-        defer rl.EndDrawing();
+        // Update (zoom/pan/cursor input)
+        time_plot.update();
 
-        rl.ClearBackground(rl.BLACK);
-        plot.drawBg(rl.GRAY);
-
+        // Copy sample data from ring buffer
         try rx_state.mutex.lock(io);
         const rx_total_bytes = rx_state.bytes_transfered;
 
@@ -227,15 +183,24 @@ pub fn main(init: std.process.Init) !void {
         }
         rx_state.mutex.unlock(io);
 
+        // Convert IQ samples to float arrays
         for (samples, 0..) |s, i| {
             const f = s.toFloat();
-            points[i] = plot.map(@floatFromInt(i), f[0]);
+            i_samples[i] = f[0];
+            q_samples[i] = f[1];
         }
 
-        // Draw waveform clipped to plot area
-        plot.beginClip();
-        rl.DrawLineStrip(@ptrCast(points.ptr), @intCast(points.len), rl.GREEN);
-        PlotSpace.endClip();
+        // Set data each frame
+        time_plot.clear();
+        time_plot.plotY(i_samples, .{ .color = rl.GREEN, .label = "I" });
+        time_plot.plotY(q_samples, .{ .color = rl.RED, .label = "Q" });
+
+        // Draw
+        rl.BeginDrawing();
+        defer rl.EndDrawing();
+
+        rl.ClearBackground(.{ .r = 30, .g = 30, .b = 30, .a = 255 });
+        time_plot.render();
 
         var rx_stat_str_buf = std.mem.zeroes([128]u8);
 
@@ -245,7 +210,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try std.fmt.bufPrint(&rx_stat_str_buf, "Received {d} MB @ {d:.2} MB/s", .{ rx_total_bytes / mb(1), (@as(f64, @floatFromInt(rx_total_bytes)) / elapsed_time) / mb(1) });
 
         rl.DrawText(&rx_stat_str_buf, 10, 10, 20, rl.MAROON);
-        rl.DrawFPS(screen_width - 100, 10);
+        //rl.DrawFPS(screen_width - 100, 10);
     }
 
     rx_state.should_stop = true;

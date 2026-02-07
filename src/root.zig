@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
+pub const c = @cImport({
     @cInclude("hackrf.h");
 });
 
@@ -107,6 +107,14 @@ pub const SweepStyle = enum(c_uint) {
     interleaved = c.INTERLEAVED,
 };
 
+/// Return value for Zig-native streaming callbacks
+pub const StreamAction = enum {
+    /// Continue streaming
+    @"continue",
+    /// Stop streaming
+    stop,
+};
+
 /// USB transfer information passed to RX or TX callback
 pub const Transfer = struct {
     inner: *c.hackrf_transfer,
@@ -136,15 +144,65 @@ pub const Transfer = struct {
     }
 };
 
-/// Callback function type for RX/TX streaming
-/// Return 0 to continue streaming, non-zero to stop
-pub const SampleBlockCallback = *const fn ([*c]c.hackrf_transfer) callconv(.c) c_int;
+/// Raw C callback types for advanced users who need direct C interop
+pub const RawCallbacks = struct {
+    /// Raw C callback for RX/TX streaming. Return 0 to continue, non-zero to stop.
+    pub const SampleBlock = *const fn ([*c]c.hackrf_transfer) callconv(.c) c_int;
+    /// Raw C callback for TX block complete notification
+    pub const TxBlockComplete = *const fn ([*c]c.hackrf_transfer, c_int) callconv(.c) void;
+    /// Raw C callback for TX flush notification
+    pub const Flush = *const fn (?*anyopaque, c_int) callconv(.c) void;
+};
 
-/// Callback function type for TX block complete
-pub const TxBlockCompleteCallback = *const fn ([*c]c.hackrf_transfer, c_int) callconv(.c) void;
+/// Generates a C-compatible trampoline for RX/TX/Sweep sample block callbacks.
+/// Wraps a Zig-native `fn(Transfer, Ctx) StreamAction` into a C function pointer.
+fn SampleBlockTrampoline(comptime Ctx: type, comptime callback: fn (Transfer, Ctx) StreamAction, comptime ctx_field: enum { rx, tx }) type {
+    return struct {
+        fn trampoline(raw_transfer: [*c]c.hackrf_transfer) callconv(.c) c_int {
+            const transfer: Transfer = .{ .inner = raw_transfer };
+            const ctx: Ctx = if (Ctx == void)
+                {}
+            else
+                @ptrCast(@alignCast(switch (ctx_field) {
+                    .rx => raw_transfer.*.rx_ctx,
+                    .tx => raw_transfer.*.tx_ctx,
+                }));
+            return switch (callback(transfer, ctx)) {
+                .@"continue" => 0,
+                .stop => -1,
+            };
+        }
+    };
+}
 
-/// Callback function type for TX flush
-pub const FlushCallback = *const fn (?*anyopaque, c_int) callconv(.c) void;
+/// Generates a C-compatible trampoline for TX block complete callbacks.
+/// Wraps a Zig-native `fn(Transfer, bool, Ctx) void` into a C function pointer.
+fn TxBlockCompleteTrampoline(comptime Ctx: type, comptime callback: fn (Transfer, bool, Ctx) void) type {
+    return struct {
+        fn trampoline(raw_transfer: [*c]c.hackrf_transfer, success: c_int) callconv(.c) void {
+            const transfer: Transfer = .{ .inner = raw_transfer };
+            const ctx: Ctx = if (Ctx == void)
+                {}
+            else
+                @ptrCast(@alignCast(raw_transfer.*.tx_ctx));
+            callback(transfer, success == 0, ctx);
+        }
+    };
+}
+
+/// Generates a C-compatible trampoline for flush callbacks.
+/// Wraps a Zig-native `fn(Ctx, bool) void` into a C function pointer.
+fn FlushTrampoline(comptime Ctx: type, comptime callback: fn (Ctx, bool) void) type {
+    return struct {
+        fn trampoline(raw_ctx: ?*anyopaque, success: c_int) callconv(.c) void {
+            const ctx: Ctx = if (Ctx == void)
+                {}
+            else
+                @ptrCast(@alignCast(raw_ctx));
+            callback(ctx, success == 0);
+        }
+    };
+}
 
 /// M0 core state
 pub const M0State = extern struct {
@@ -242,13 +300,20 @@ pub const Device = struct {
 
     // === Streaming ===
 
-    /// Start receiving samples
-    pub fn startRx(self: Device, callback: SampleBlockCallback, ctx: ?*anyopaque) Error!void {
+    /// Start receiving samples with a Zig-native callback.
+    /// Callback signature: `fn(Transfer, Ctx) StreamAction`
+    pub fn startRx(self: Device, comptime Ctx: type, comptime callback: fn (Transfer, Ctx) StreamAction, ctx: Ctx) Error!void {
+        const T = SampleBlockTrampoline(Ctx, callback, .rx);
         try checkResult(c.hackrf_start_rx(
             self.handle,
-            @ptrCast(callback),
-            ctx,
+            @ptrCast(&T.trampoline),
+            if (Ctx == void) null else @ptrCast(@alignCast(ctx)),
         ));
+    }
+
+    /// Start receiving samples with a raw C callback
+    pub fn startRxRaw(self: Device, callback: RawCallbacks.SampleBlock, ctx: ?*anyopaque) Error!void {
+        try checkResult(c.hackrf_start_rx(self.handle, @ptrCast(callback), ctx));
     }
 
     /// Stop receiving
@@ -256,13 +321,20 @@ pub const Device = struct {
         try checkResult(c.hackrf_stop_rx(self.handle));
     }
 
-    /// Start transmitting samples
-    pub fn startTx(self: Device, callback: SampleBlockCallback, ctx: ?*anyopaque) Error!void {
+    /// Start transmitting samples with a Zig-native callback.
+    /// Callback signature: `fn(Transfer, Ctx) StreamAction`
+    pub fn startTx(self: Device, comptime Ctx: type, comptime callback: fn (Transfer, Ctx) StreamAction, ctx: Ctx) Error!void {
+        const T = SampleBlockTrampoline(Ctx, callback, .tx);
         try checkResult(c.hackrf_start_tx(
             self.handle,
-            @ptrCast(callback),
-            ctx,
+            @ptrCast(&T.trampoline),
+            if (Ctx == void) null else @ptrCast(@alignCast(ctx)),
         ));
+    }
+
+    /// Start transmitting samples with a raw C callback
+    pub fn startTxRaw(self: Device, callback: RawCallbacks.SampleBlock, ctx: ?*anyopaque) Error!void {
+        try checkResult(c.hackrf_start_tx(self.handle, @ptrCast(callback), ctx));
     }
 
     /// Stop transmitting
@@ -270,13 +342,31 @@ pub const Device = struct {
         try checkResult(c.hackrf_stop_tx(self.handle));
     }
 
-    /// Set TX block complete callback
-    pub fn setTxBlockCompleteCallback(self: Device, callback: TxBlockCompleteCallback) Error!void {
+    /// Set TX block complete callback with a Zig-native callback.
+    /// Callback signature: `fn(Transfer, bool, Ctx) void`
+    pub fn setTxBlockCompleteCallback(self: Device, comptime Ctx: type, comptime callback: fn (Transfer, bool, Ctx) void) Error!void {
+        const T = TxBlockCompleteTrampoline(Ctx, callback);
+        try checkResult(c.hackrf_set_tx_block_complete_callback(self.handle, @ptrCast(&T.trampoline)));
+    }
+
+    /// Set TX block complete callback with a raw C callback
+    pub fn setTxBlockCompleteCallbackRaw(self: Device, callback: RawCallbacks.TxBlockComplete) Error!void {
         try checkResult(c.hackrf_set_tx_block_complete_callback(self.handle, @ptrCast(callback)));
     }
 
-    /// Enable TX flush callback
-    pub fn enableTxFlush(self: Device, callback: FlushCallback, ctx: ?*anyopaque) Error!void {
+    /// Enable TX flush with a Zig-native callback.
+    /// Callback signature: `fn(Ctx, bool) void`
+    pub fn enableTxFlush(self: Device, comptime Ctx: type, comptime callback: fn (Ctx, bool) void, ctx: Ctx) Error!void {
+        const T = FlushTrampoline(Ctx, callback);
+        try checkResult(c.hackrf_enable_tx_flush(
+            self.handle,
+            @ptrCast(&T.trampoline),
+            if (Ctx == void) null else @ptrCast(@alignCast(ctx)),
+        ));
+    }
+
+    /// Enable TX flush with a raw C callback
+    pub fn enableTxFlushRaw(self: Device, callback: RawCallbacks.Flush, ctx: ?*anyopaque) Error!void {
         try checkResult(c.hackrf_enable_tx_flush(self.handle, @ptrCast(callback), ctx));
     }
 
@@ -445,8 +535,19 @@ pub const Device = struct {
         ));
     }
 
-    /// Start RX sweep
-    pub fn startRxSweep(self: Device, callback: SampleBlockCallback, ctx: ?*anyopaque) Error!void {
+    /// Start RX sweep with a Zig-native callback.
+    /// Callback signature: `fn(Transfer, Ctx) StreamAction`
+    pub fn startRxSweep(self: Device, comptime Ctx: type, comptime callback: fn (Transfer, Ctx) StreamAction, ctx: Ctx) Error!void {
+        const T = SampleBlockTrampoline(Ctx, callback, .rx);
+        try checkResult(c.hackrf_start_rx_sweep(
+            self.handle,
+            @ptrCast(&T.trampoline),
+            if (Ctx == void) null else @ptrCast(@alignCast(ctx)),
+        ));
+    }
+
+    /// Start RX sweep with a raw C callback
+    pub fn startRxSweepRaw(self: Device, callback: RawCallbacks.SampleBlock, ctx: ?*anyopaque) Error!void {
         try checkResult(c.hackrf_start_rx_sweep(self.handle, @ptrCast(callback), ctx));
     }
 
@@ -648,26 +749,18 @@ const TestFixture = struct {
     }
 };
 
-// Test callbacks - use raw C types for compatibility
-fn testRxCallback(transfer: [*c]c.hackrf_transfer) callconv(.c) c_int {
-    _ = transfer;
-    return -1; // stop immediately
+// Test callbacks using Zig-native signatures
+fn testRxCallback(_: Transfer, _: void) StreamAction {
+    return .stop;
 }
 
-fn testTxCallback(transfer: [*c]c.hackrf_transfer) callconv(.c) c_int {
-    _ = transfer;
-    return -1; // stop immediately
+fn testTxCallback(_: Transfer, _: void) StreamAction {
+    return .stop;
 }
 
-fn testTxBlockCompleteCallback(transfer: [*c]c.hackrf_transfer, success: c_int) callconv(.c) void {
-    _ = transfer;
-    _ = success;
-}
+fn testTxBlockCompleteCallback(_: Transfer, _: bool, _: void) void {}
 
-fn testFlushCallback(ctx: ?*anyopaque, success: c_int) callconv(.c) void {
-    _ = ctx;
-    _ = success;
-}
+fn testFlushCallback(_: void, _: bool) void {}
 
 // === Library Function Tests ===
 
@@ -1157,12 +1250,12 @@ test "device start and stop rx" {
     try fixture.device.setFreq(900_000_000);
     try fixture.device.setSampleRate(10_000_000);
 
-    try fixture.device.startRx(testRxCallback, null);
+    try fixture.device.startRx(void, testRxCallback, {});
 
     // Brief delay to let streaming start
-    // Give brief time for streaming to start (callback returns -1 to stop)
+    // Give brief time for streaming to start (callback returns .stop)
 
-    // Streaming should be active (or callback returned -1 to stop)
+    // Streaming should be active (or callback returned .stop)
     fixture.device.stopRx() catch {};
 }
 
@@ -1176,10 +1269,10 @@ test "device start and stop tx" {
     try fixture.device.setFreq(900_000_000);
     try fixture.device.setSampleRate(10_000_000);
 
-    try fixture.device.startTx(testTxCallback, null);
+    try fixture.device.startTx(void, testTxCallback, {});
 
     // Brief delay
-    // Give brief time for streaming to start (callback returns -1 to stop)
+    // Give brief time for streaming to start (callback returns .stop)
 
     fixture.device.stopTx() catch {};
 }
@@ -1190,7 +1283,7 @@ test "device tx block complete callback" {
     var fixture = try TestFixture.setup();
     defer fixture.teardown();
 
-    try fixture.device.setTxBlockCompleteCallback(testTxBlockCompleteCallback);
+    try fixture.device.setTxBlockCompleteCallback(void, testTxBlockCompleteCallback);
 }
 
 test "device tx flush callback" {
@@ -1199,7 +1292,7 @@ test "device tx flush callback" {
     var fixture = try TestFixture.setup();
     defer fixture.teardown();
 
-    try fixture.device.enableTxFlush(testFlushCallback, null);
+    try fixture.device.enableTxFlush(void, testFlushCallback, {});
 }
 
 // === Sweep Tests (Hardware Required) ===
@@ -1239,9 +1332,9 @@ test "device start rx sweep" {
         .linear,
     );
 
-    try fixture.device.startRxSweep(testRxCallback, null);
+    try fixture.device.startRxSweep(void, testRxCallback, {});
 
-    // Give brief time for streaming to start (callback returns -1 to stop)
+    // Give brief time for streaming to start (callback returns .stop)
 
     fixture.device.stopRx() catch {};
 }

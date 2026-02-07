@@ -40,6 +40,10 @@
             .url = "https://github.com/libusb/libusb/archive/refs/tags/v1.0.27.tar.gz",
             .hash = "N-V-__8AAGSMGgDb5aXYKy35qSci9DNnFT7K51Y6qzdhG82Z",
         },
+        .raylib = .{
+            .url = "https://github.com/PavoReal/raylib-zig-0.16/archive/refs/heads/master.zip",
+            .hash = "raylib-5.6.0-dev-whq8uNkuDQX9lIXcfJBAb-aMM2-g3NrQR_IUKOouAku6",
+        },
     },
     .paths = .{
         "build.zig",

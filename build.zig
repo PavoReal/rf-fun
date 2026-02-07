@@ -164,6 +164,15 @@ pub fn build(b: *std.Build) void {
     });
     
     //
+    // Build raylib from source (uses fork's Zig 0.16-compatible build.zig)
+    //
+    const raylib_dep = b.dependency("raylib", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const raylib = raylib_dep.artifact("raylib");
+
+    //
     // root module
     //
 
@@ -193,6 +202,9 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.linkLibrary(libhackrf);
     exe.root_module.addIncludePath(hackrf_dep.path("host/libhackrf/src"));
+
+    exe.root_module.linkLibrary(raylib);
+    exe.root_module.addIncludePath(raylib_dep.path("src"));
 
     b.installArtifact(exe);
 

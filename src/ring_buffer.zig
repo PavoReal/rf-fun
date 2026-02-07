@@ -73,6 +73,29 @@ pub fn FixedSizeRingBuffer(comptime T: type) type {
                 .second = self.buf[0..self.head],
             };
         }
+
+        /// Return up to `n` of the oldest elements as split slices.
+        pub fn oldest(self: Self, n: usize) Slices {
+            const want = @min(n, self.count);
+            if (want == 0) return .{ .first = &.{}, .second = &.{} };
+            const s = self.slices();
+            if (want <= s.first.len) {
+                return .{ .first = s.first[0..want], .second = &.{} };
+            }
+            return .{ .first = s.first, .second = s.second[0 .. want - s.first.len] };
+        }
+
+        /// Return up to `n` of the newest elements as split slices.
+        pub fn newest(self: Self, n: usize) Slices {
+            const want = @min(n, self.count);
+            if (want == 0) return .{ .first = &.{}, .second = &.{} };
+            const s = self.slices();
+            if (want <= s.second.len) {
+                return .{ .first = &.{}, .second = s.second[s.second.len - want ..] };
+            }
+            const from_first = want - s.second.len;
+            return .{ .first = s.first[s.first.len - from_first ..], .second = s.second };
+        }
     };
 }
 
@@ -201,6 +224,147 @@ test "multiple small appends then overwrite" {
     @memcpy(result[0..s.first.len], s.first);
     @memcpy(result[s.first.len..][0..s.second.len], s.second);
     try testing.expectEqualSlices(u8, &.{ 2, 3, 4, 5 }, &result);
+}
+
+// === oldest/newest tests ===
+
+fn collectSlices(s: RingBuf.Slices, out: []u8) []u8 {
+    @memcpy(out[0..s.first.len], s.first);
+    @memcpy(out[s.first.len..][0..s.second.len], s.second);
+    return out[0 .. s.first.len + s.second.len];
+}
+
+test "oldest on empty buffer" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    const s = rb.oldest(3);
+    try testing.expectEqual(@as(usize, 0), s.first.len + s.second.len);
+}
+
+test "newest on empty buffer" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    const s = rb.newest(3);
+    try testing.expectEqual(@as(usize, 0), s.first.len + s.second.len);
+}
+
+test "oldest n=0" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2, 3 });
+    const s = rb.oldest(0);
+    try testing.expectEqual(@as(usize, 0), s.first.len + s.second.len);
+}
+
+test "newest n=0" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2, 3 });
+    const s = rb.newest(0);
+    try testing.expectEqual(@as(usize, 0), s.first.len + s.second.len);
+}
+
+test "oldest partial, no wrap" {
+    var rb = try RingBuf.init(testing.allocator, 8);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 10, 20, 30, 40, 50 });
+    var buf: [8]u8 = undefined;
+    const result = collectSlices(rb.oldest(3), &buf);
+    try testing.expectEqualSlices(u8, &.{ 10, 20, 30 }, result);
+}
+
+test "newest partial, no wrap" {
+    var rb = try RingBuf.init(testing.allocator, 8);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 10, 20, 30, 40, 50 });
+    var buf: [8]u8 = undefined;
+    const result = collectSlices(rb.newest(3), &buf);
+    try testing.expectEqualSlices(u8, &.{ 30, 40, 50 }, result);
+}
+
+test "oldest clamps to count" {
+    var rb = try RingBuf.init(testing.allocator, 8);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2 });
+    var buf: [8]u8 = undefined;
+    const result = collectSlices(rb.oldest(100), &buf);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, result);
+}
+
+test "newest clamps to count" {
+    var rb = try RingBuf.init(testing.allocator, 8);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2 });
+    var buf: [8]u8 = undefined;
+    const result = collectSlices(rb.newest(100), &buf);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, result);
+}
+
+test "oldest with wrap, spans both segments" {
+    // buf capacity 4, write 6 items -> oldest is [3,4,5,6]
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2, 3, 4, 5, 6 });
+    // full contents: [3, 4, 5, 6]
+    var buf: [4]u8 = undefined;
+
+    // oldest 2 should be [3, 4]
+    const o2 = collectSlices(rb.oldest(2), &buf);
+    try testing.expectEqualSlices(u8, &.{ 3, 4 }, o2);
+
+    // oldest 3 should span both slices: [3, 4, 5]
+    const o3 = collectSlices(rb.oldest(3), &buf);
+    try testing.expectEqualSlices(u8, &.{ 3, 4, 5 }, o3);
+
+    // oldest 4 = all
+    const o4 = collectSlices(rb.oldest(4), &buf);
+    try testing.expectEqualSlices(u8, &.{ 3, 4, 5, 6 }, o4);
+}
+
+test "newest with wrap, spans both segments" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2, 3, 4, 5, 6 });
+    // full contents oldest->newest: [3, 4, 5, 6]
+    var buf: [4]u8 = undefined;
+
+    // newest 1 = [6]
+    const n1 = collectSlices(rb.newest(1), &buf);
+    try testing.expectEqualSlices(u8, &.{ 6 }, n1);
+
+    // newest 2 = [5, 6]
+    const n2 = collectSlices(rb.newest(2), &buf);
+    try testing.expectEqualSlices(u8, &.{ 5, 6 }, n2);
+
+    // newest 3 spans both segments: [4, 5, 6]
+    const n3 = collectSlices(rb.newest(3), &buf);
+    try testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, n3);
+
+    // newest 4 = all
+    const n4 = collectSlices(rb.newest(4), &buf);
+    try testing.expectEqualSlices(u8, &.{ 3, 4, 5, 6 }, n4);
+}
+
+test "oldest and newest agree on full buffer" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 10, 20, 30, 40 });
+    var buf_o: [4]u8 = undefined;
+    var buf_n: [4]u8 = undefined;
+    const all_oldest = collectSlices(rb.oldest(4), &buf_o);
+    const all_newest = collectSlices(rb.newest(4), &buf_n);
+    try testing.expectEqualSlices(u8, all_oldest, all_newest);
 }
 
 test "works with extern struct type" {

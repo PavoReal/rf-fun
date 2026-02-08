@@ -1,5 +1,4 @@
 const std = @import("std");
-
 pub const rl = @cImport({
     @cInclude("raylib.h");
 });
@@ -17,16 +16,16 @@ pub const Config = struct {
     rect: rl.Rectangle = .{ .x = 10, .y = 50, .width = 780, .height = 400 },
     x_range: ?[2]f32 = null, // null = auto-fit
     y_range: ?[2]f32 = null, // null = auto-scale
-    bg_color: rl.Color = .{ .r = 240, .g = 240, .b = 240, .a = 255 },
+    bg_color: rl.Color = rl.DARKGRAY,
     grid: bool = true,
-    grid_color: rl.Color = .{ .r = 200, .g = 200, .b = 200, .a = 255 },
+    grid_color: rl.Color = .{ .r = 80, .g = 80, .b = 80, .a = 255 },
     legend: bool = true,
     legend_pos: LegendPos = .top_right,
 };
 
 pub const Style = struct {
     color: rl.Color = rl.GREEN,
-    thickness: f32 = 2.0,
+    thickness: f32 = 1.0,
     point_radius: f32 = 0, // 0 = no markers
     label: ?[*:0]const u8 = null,
     fill: bool = false,
@@ -40,20 +39,11 @@ const Series = struct {
 
 const max_series = 8;
 
-// ── MATLAB-style colors ──────────────────────────────────
-
-const dark_text: rl.Color = .{ .r = 51, .g = 51, .b = 51, .a = 255 };
-const axes_color: rl.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
-const legend_bg: rl.Color = .{ .r = 255, .g = 255, .b = 255, .a = 230 };
-const legend_border: rl.Color = .{ .r = 180, .g = 180, .b = 180, .a = 255 };
-
 // ── Plot state ───────────────────────────────────────────
 
 config: Config,
 series: [max_series]Series = undefined,
 series_count: usize = 0,
-series_visible: [max_series]bool = .{true} ** max_series,
-user_view: bool = false,
 
 // View ranges (zoom/pan state)
 view_x: [2]f32,
@@ -120,26 +110,6 @@ pub fn update(self: *Plot) void {
     // Auto-scale when ranges are null
     self.autoScale();
 
-    // Legend click detection — check before pan so we can suppress drag
-    var legend_clicked = false;
-    if (self.config.legend and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
-        legend_clicked = self.handleLegendClick(mx, my);
-    }
-
-    // Reset button click
-    var reset_clicked = false;
-    if (self.user_view and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
-        const btn = self.resetButtonRect();
-        if (mx >= btn.x and mx <= btn.x + btn.width and
-            my >= btn.y and my <= btn.y + btn.height)
-        {
-            self.view_x = self.orig_x;
-            self.view_y = self.orig_y;
-            self.user_view = false;
-            reset_clicked = true;
-        }
-    }
-
     // Zoom with mouse wheel
     if (in_rect) {
         const wheel = rl.GetMouseWheelMove();
@@ -158,14 +128,12 @@ pub fn update(self: *Plot) void {
 
             self.view_x = .{ cx - half_w, cx + half_w };
             self.view_y = .{ cy - half_h, cy + half_h };
-            self.user_view = true;
         }
     }
 
-    // Pan with click-drag (suppress if legend or reset button was clicked)
-    if (in_rect and !legend_clicked and !reset_clicked and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
+    // Pan with click-drag
+    if (in_rect and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
         self.dragging = true;
-        self.user_view = true;
         self.drag_start = .{ .x = mx, .y = my };
         self.drag_view_x_start = self.view_x;
         self.drag_view_y_start = self.view_y;
@@ -192,11 +160,13 @@ pub fn update(self: *Plot) void {
         }
     }
 
-    // Right-click to reset view
+    // Double-click to reset
+    if (in_rect and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
+        // Raylib doesn't have native double-click; use right-click as reset
+    }
     if (in_rect and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_RIGHT)) {
         self.view_x = self.orig_x;
         self.view_y = self.orig_y;
-        self.user_view = false;
     }
 }
 
@@ -208,24 +178,10 @@ pub fn render(self: *Plot) void {
     // Background
     rl.DrawRectangleRec(r, self.config.bg_color);
 
-    // Grid (dashed)
+    // Grid
     if (self.config.grid) {
         self.drawGrid();
     }
-
-    // Axes: left + bottom edges, 2px thick, black
-    rl.DrawLineEx(
-        .{ .x = r.x, .y = r.y },
-        .{ .x = r.x, .y = r.y + r.height },
-        2,
-        axes_color,
-    );
-    rl.DrawLineEx(
-        .{ .x = r.x, .y = r.y + r.height },
-        .{ .x = r.x + r.width, .y = r.y + r.height },
-        2,
-        axes_color,
-    );
 
     // Scissor clip for data
     rl.BeginScissorMode(
@@ -235,24 +191,25 @@ pub fn render(self: *Plot) void {
         @intFromFloat(r.height),
     );
 
-    // Draw each visible series
+    // Draw each series
     for (0..self.series_count) |i| {
-        if (self.series_visible[i]) {
-            self.drawSeries(self.series[i]);
-        }
+        self.drawSeries(self.series[i]);
     }
 
     rl.EndScissorMode();
 
+    // Border
+    rl.DrawRectangleLinesEx(r, 1, rl.WHITE);
+
     // Title
     if (self.config.title) |title| {
-        const tw = rl.MeasureText(title, 18);
+        const tw = rl.MeasureText(title, 16);
         rl.DrawText(
             title,
             @intFromFloat(r.x + r.width / 2 - @as(f32, @floatFromInt(tw)) / 2),
-            @intFromFloat(r.y - 24),
-            18,
-            axes_color,
+            @intFromFloat(r.y - 20),
+            16,
+            rl.WHITE,
         );
     }
 
@@ -262,9 +219,9 @@ pub fn render(self: *Plot) void {
         rl.DrawText(
             xlabel,
             @intFromFloat(r.x + r.width / 2 - @as(f32, @floatFromInt(tw)) / 2),
-            @intFromFloat(r.y + r.height + 18),
+            @intFromFloat(r.y + r.height + 5),
             14,
-            dark_text,
+            rl.LIGHTGRAY,
         );
     }
 
@@ -275,7 +232,7 @@ pub fn render(self: *Plot) void {
             @intFromFloat(r.x - 45),
             @intFromFloat(r.y + r.height / 2 - 7),
             14,
-            dark_text,
+            rl.LIGHTGRAY,
         );
     }
 
@@ -284,50 +241,8 @@ pub fn render(self: *Plot) void {
         self.drawLegend();
     }
 
-    // Reset view button (only when zoomed/panned)
-    if (self.user_view) {
-        self.drawResetButton();
-    }
-
     // Cursor readout
     self.drawCursor();
-}
-
-// ── Internal: reset button ───────────────────────────────
-
-fn resetButtonRect(self: *const Plot) rl.Rectangle {
-    const r = self.config.rect;
-    const btn_w: f32 = 54;
-    const btn_h: f32 = 22;
-    return .{
-        .x = r.x + r.width - btn_w - 6,
-        .y = r.y + 6,
-        .width = btn_w,
-        .height = btn_h,
-    };
-}
-
-fn drawResetButton(self: *const Plot) void {
-    const btn = self.resetButtonRect();
-    const mx = @as(f32, @floatFromInt(rl.GetMouseX()));
-    const my = @as(f32, @floatFromInt(rl.GetMouseY()));
-    const hovered = mx >= btn.x and mx <= btn.x + btn.width and
-        my >= btn.y and my <= btn.y + btn.height;
-
-    const bg = if (hovered)
-        rl.Color{ .r = 220, .g = 220, .b = 220, .a = 240 }
-    else
-        rl.Color{ .r = 245, .g = 245, .b = 245, .a = 220 };
-
-    rl.DrawRectangleRec(btn, bg);
-    rl.DrawRectangleLinesEx(btn, 1, legend_border);
-    rl.DrawText(
-        "Reset",
-        @intFromFloat(btn.x + 10),
-        @intFromFloat(btn.y + 4),
-        13,
-        dark_text,
-    );
 }
 
 // ── Internal: coordinate mapping ─────────────────────────
@@ -360,36 +275,11 @@ fn niceTick(range: f32, target_count: f32) f32 {
     return nice * mag;
 }
 
-// ── Internal: dashed line helpers ────────────────────────
-
-fn drawDashedLineH(y: f32, x_start: f32, x_end: f32, color: rl.Color) void {
-    const dash: f32 = 6;
-    const gap: f32 = 4;
-    var x = x_start;
-    while (x < x_end) {
-        const seg_end = @min(x + dash, x_end);
-        rl.DrawLineV(.{ .x = x, .y = y }, .{ .x = seg_end, .y = y }, color);
-        x += dash + gap;
-    }
-}
-
-fn drawDashedLineV(x: f32, y_start: f32, y_end: f32, color: rl.Color) void {
-    const dash: f32 = 6;
-    const gap: f32 = 4;
-    var y = y_start;
-    while (y < y_end) {
-        const seg_end = @min(y + dash, y_end);
-        rl.DrawLineV(.{ .x = x, .y = y }, .{ .x = x, .y = seg_end }, color);
-        y += dash + gap;
-    }
-}
-
 // ── Internal: grid ───────────────────────────────────────
 
 fn drawGrid(self: *Plot) void {
     const r = self.config.rect;
     const gc = self.config.grid_color;
-    const tick_len: f32 = 4;
 
     // Vertical grid lines (X axis ticks)
     const x_range = self.view_x[1] - self.view_x[0];
@@ -400,27 +290,21 @@ fn drawGrid(self: *Plot) void {
         while (x < self.view_x[1]) : (x += x_tick) {
             const sx = self.mapX(x);
             if (sx >= r.x and sx <= r.x + r.width) {
-                // Dashed vertical grid line
-                drawDashedLineV(sx, r.y, r.y + r.height, gc);
-
-                // Tick mark on bottom axis
-                rl.DrawLineEx(
+                rl.DrawLineV(
+                    .{ .x = sx, .y = r.y },
                     .{ .x = sx, .y = r.y + r.height },
-                    .{ .x = sx, .y = r.y + r.height + tick_len },
-                    1,
-                    axes_color,
+                    gc,
                 );
-
                 // Tick label
                 var buf: [32]u8 = undefined;
                 const label = formatTickLabel(&buf, x, x_tick);
-                const tw = rl.MeasureText(label, 11);
+                const tw = rl.MeasureText(label, 10);
                 rl.DrawText(
                     label,
                     @intFromFloat(sx - @as(f32, @floatFromInt(tw)) / 2),
-                    @intFromFloat(r.y + r.height + tick_len + 2),
-                    11,
-                    dark_text,
+                    @intFromFloat(r.y + r.height + 2),
+                    10,
+                    rl.LIGHTGRAY,
                 );
             }
         }
@@ -435,27 +319,20 @@ fn drawGrid(self: *Plot) void {
         while (y < self.view_y[1]) : (y += y_tick) {
             const sy = self.mapY(y);
             if (sy >= r.y and sy <= r.y + r.height) {
-                // Dashed horizontal grid line
-                drawDashedLineH(sy, r.x, r.x + r.width, gc);
-
-                // Tick mark on left axis
-                rl.DrawLineEx(
-                    .{ .x = r.x - tick_len, .y = sy },
+                rl.DrawLineV(
                     .{ .x = r.x, .y = sy },
-                    1,
-                    axes_color,
+                    .{ .x = r.x + r.width, .y = sy },
+                    gc,
                 );
-
                 // Tick label
                 var buf: [32]u8 = undefined;
                 const label = formatTickLabel(&buf, y, y_tick);
-                const tw = rl.MeasureText(label, 11);
                 rl.DrawText(
                     label,
-                    @intFromFloat(r.x - tick_len - 4 - @as(f32, @floatFromInt(tw))),
+                    @intFromFloat(r.x - 40),
                     @intFromFloat(sy - 5),
-                    11,
-                    dark_text,
+                    10,
+                    rl.LIGHTGRAY,
                 );
             }
         }
@@ -553,39 +430,31 @@ fn fadeColor(c: rl.Color, alpha: u8) rl.Color {
     return .{ .r = c.r, .g = c.g, .b = c.b, .a = alpha };
 }
 
-// ── Internal: legend layout helpers ──────────────────────
+// ── Internal: legend ─────────────────────────────────────
 
-const legend_pad: f32 = 8;
-const legend_line_h: f32 = 18;
-const legend_swatch_w: f32 = 14;
-const legend_font_size: c_int = 12;
-
-const LegendLayout = struct {
-    lx: f32,
-    ly: f32,
-    box_w: f32,
-    box_h: f32,
-    label_count: usize,
-};
-
-fn legendLayout(self: *const Plot) LegendLayout {
+fn drawLegend(self: *Plot) void {
+    // Count labeled series
     var label_count: usize = 0;
     for (0..self.series_count) |i| {
         if (self.series[i].style.label != null) label_count += 1;
     }
+    if (label_count == 0) return;
 
     const r = self.config.rect;
-    const box_h = @as(f32, @floatFromInt(label_count)) * legend_line_h + legend_pad * 2;
+    const pad: f32 = 8;
+    const line_h: f32 = 16;
+    const swatch_w: f32 = 12;
+    const box_h = @as(f32, @floatFromInt(label_count)) * line_h + pad * 2;
 
     // Measure max label width
     var max_w: c_int = 0;
     for (0..self.series_count) |i| {
         if (self.series[i].style.label) |lbl| {
-            const w = rl.MeasureText(lbl, legend_font_size);
+            const w = rl.MeasureText(lbl, 12);
             if (w > max_w) max_w = w;
         }
     }
-    const box_w = @as(f32, @floatFromInt(max_w)) + legend_swatch_w + legend_pad * 3 + 4;
+    const box_w = @as(f32, @floatFromInt(max_w)) + swatch_w + pad * 3;
 
     // Position
     var lx: f32 = undefined;
@@ -609,95 +478,29 @@ fn legendLayout(self: *const Plot) LegendLayout {
         },
     }
 
-    return .{ .lx = lx, .ly = ly, .box_w = box_w, .box_h = box_h, .label_count = label_count };
-}
-
-// ── Internal: legend click handling ──────────────────────
-
-fn handleLegendClick(self: *Plot, mx: f32, my: f32) bool {
-    const layout = self.legendLayout();
-    if (layout.label_count == 0) return false;
-
-    // Check if click is inside legend box
-    if (mx < layout.lx or mx > layout.lx + layout.box_w or
-        my < layout.ly or my > layout.ly + layout.box_h)
-        return false;
-
-    // Find which entry was clicked
-    var row: f32 = 0;
-    for (0..self.series_count) |i| {
-        if (self.series[i].style.label != null) {
-            const ey = layout.ly + legend_pad + row * legend_line_h;
-            if (my >= ey and my < ey + legend_line_h) {
-                self.series_visible[i] = !self.series_visible[i];
-                return true;
-            }
-            row += 1;
-        }
-    }
-    return false;
-}
-
-// ── Internal: legend ─────────────────────────────────────
-
-fn drawLegend(self: *Plot) void {
-    const layout = self.legendLayout();
-    if (layout.label_count == 0) return;
-
-    const lx = layout.lx;
-    const ly = layout.ly;
-
-    // Background with border
+    // Background
     rl.DrawRectangleRec(
-        .{ .x = lx, .y = ly, .width = layout.box_w, .height = layout.box_h },
-        legend_bg,
-    );
-    rl.DrawRectangleLinesEx(
-        .{ .x = lx, .y = ly, .width = layout.box_w, .height = layout.box_h },
-        1,
-        legend_border,
+        .{ .x = lx, .y = ly, .width = box_w, .height = box_h },
+        .{ .r = 0, .g = 0, .b = 0, .a = 160 },
     );
 
     // Entries
     var row: f32 = 0;
     for (0..self.series_count) |i| {
         if (self.series[i].style.label) |lbl| {
-            const ey = ly + legend_pad + row * legend_line_h;
-            const visible = self.series_visible[i];
-
-            const swatch_x = lx + legend_pad;
-            const swatch_y = ey + 3;
-            const swatch_h: f32 = 12;
-
-            if (visible) {
-                // Filled color swatch
-                rl.DrawRectangleRec(
-                    .{ .x = swatch_x, .y = swatch_y, .width = legend_swatch_w, .height = swatch_h },
-                    self.series[i].style.color,
-                );
-            } else {
-                // Dimmed swatch (reduced alpha)
-                rl.DrawRectangleRec(
-                    .{ .x = swatch_x, .y = swatch_y, .width = legend_swatch_w, .height = swatch_h },
-                    fadeColor(self.series[i].style.color, 80),
-                );
-                // Strikethrough line over swatch
-                rl.DrawLineEx(
-                    .{ .x = swatch_x - 1, .y = swatch_y + swatch_h / 2 },
-                    .{ .x = swatch_x + legend_swatch_w + 1, .y = swatch_y + swatch_h / 2 },
-                    2,
-                    axes_color,
-                );
-            }
-
+            const ey = ly + pad + row * line_h;
+            // Color swatch
+            rl.DrawRectangleRec(
+                .{ .x = lx + pad, .y = ey + 2, .width = swatch_w, .height = 10 },
+                self.series[i].style.color,
+            );
             // Label text
-            const text_color: rl.Color = if (visible) dark_text else .{ .r = 160, .g = 160, .b = 160, .a = 255 };
             rl.DrawText(
                 lbl,
-                @intFromFloat(swatch_x + legend_swatch_w + legend_pad),
-                @intFromFloat(ey + 1),
-                legend_font_size,
-                text_color,
+                @intFromFloat(lx + pad + swatch_w + pad),
+                @intFromFloat(ey),
+                12,
+                rl.WHITE,
             );
             row += 1;
         }
@@ -716,8 +519,8 @@ fn drawCursor(self: *Plot) void {
 
     if (!in_rect) return;
 
-    // Crosshair lines (subtle dark on light bg)
-    const cross_color = rl.Color{ .r = 100, .g = 100, .b = 100, .a = 60 };
+    // Crosshair lines
+    const cross_color = rl.Color{ .r = 255, .g = 255, .b = 255, .a = 80 };
     rl.DrawLineV(.{ .x = mx, .y = r.y }, .{ .x = mx, .y = r.y + r.height }, cross_color);
     rl.DrawLineV(.{ .x = r.x, .y = my }, .{ .x = r.x + r.width, .y = my }, cross_color);
 
@@ -729,26 +532,15 @@ fn drawCursor(self: *Plot) void {
     var buf: [64]u8 = undefined;
     const text = std.fmt.bufPrintZ(&buf, "x:{d:.1} y:{d:.2}", .{ data_x, data_y }) catch return;
 
-    // Draw readout near cursor with semi-transparent white background
+    // Draw readout near cursor, offset to avoid overlap
     const tx: c_int = @intFromFloat(mx + 10);
     const ty: c_int = @intFromFloat(my - 18);
-    const text_w = rl.MeasureText(text.ptr, 12);
-    rl.DrawRectangleRec(
-        .{
-            .x = @as(f32, @floatFromInt(tx)) - 2,
-            .y = @as(f32, @floatFromInt(ty)) - 1,
-            .width = @as(f32, @floatFromInt(text_w)) + 4,
-            .height = 14,
-        },
-        .{ .r = 255, .g = 255, .b = 255, .a = 200 },
-    );
-    rl.DrawText(text.ptr, tx, ty, 12, dark_text);
+    rl.DrawText(text.ptr, tx, ty, 12, rl.YELLOW);
 }
 
 // ── Internal: auto-scale ─────────────────────────────────
 
 fn autoScale(self: *Plot) void {
-    if (self.user_view) return;
     if (self.series_count == 0) return;
 
     const auto_x = self.config.x_range == null;
@@ -760,10 +552,7 @@ fn autoScale(self: *Plot) void {
     var y_min: f32 = std.math.inf(f32);
     var y_max: f32 = -std.math.inf(f32);
 
-    var any_visible = false;
     for (0..self.series_count) |i| {
-        if (!self.series_visible[i]) continue;
-        any_visible = true;
         const s = self.series[i];
         for (0..s.y_data.len) |j| {
             const y = s.y_data[j];
@@ -781,8 +570,6 @@ fn autoScale(self: *Plot) void {
             }
         }
     }
-
-    if (!any_visible) return;
 
     // Add 5% padding
     if (auto_x and x_min < x_max) {

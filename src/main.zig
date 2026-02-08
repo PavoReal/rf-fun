@@ -34,8 +34,6 @@ fn gb(val: comptime_float) comptime_int {
     return @intFromFloat(val * 1e9);
 }
 
-const FFT_SIZE = 1024;
-
 const CallbackState = struct {
     mutex: std.Io.Mutex = .init,
     io: std.Io,
@@ -60,35 +58,88 @@ fn rxCallback(trans: hackrf.Transfer, state: *CallbackState) hackrf.StreamAction
     return .@"continue";
 }
 
+const SimpleFFT = struct {
+    const Self = @This();
+
+    fft_size: u32 = 0,
+    fft_in: *[]fftw.fftw_complex = undefined,
+    fft_out: *[]fftw.fftw_complex = undefined,
+    fft_plan: *fftw.fft_plan = undefined,
+    fft_mag: []f32 = undefined,
+    fft_freqs: []f32 = undefined,
+
+    pub fn init(alloc: std.mem.Allocator, fft_size: u32, center_freq: f32, fs: f32) !Self {
+        var self: Self = .{};
+
+        self.fft_size = fft_size;
+        if (self.fft_size == 0) {
+            return;
+        }
+
+        self.fft_in = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * self.fft_size)));
+        self.fft_out = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * self.fft_size)));
+        self.fft_plan = fftw.fftw_plan_dft_1d(self.fft_size, self.fft_in, self.fft_out, fftw.FFTW_FORWARD, fftw.FFTW_ESTIMATE);
+        self.fft_mag = try alloc.alloc(f32, self.fft_size);
+        self.fft_freqs = try alloc.alloc(f32, self.fft_size);
+
+        const center_freq_mhz = center_freq / mhz(1);
+        const sample_rate_mhz = fs / mhz(1);
+
+        for (0..self.fft_size) |i| {
+            const bin: f32 = @as(f32, @floatFromInt(i)) - @as(f32, self.fft_size) / 2.0;
+            self.fft_freqs[i] = center_freq_mhz + bin * sample_rate_mhz / @as(f32, self.fft_size);
+        }
+
+        return self;
+    }
+
+    pub fn calc(self: *Self, dat_i: []f32, dat_q: []f32) void {
+        std.debug.assert(dat_i.len >= self.fft_size);
+        std.debug.assert(dat_q.len >= self.fft_size);
+
+        for (0..self.fft_size) |i| {
+            self.fft_in[i][0] = dat_i;
+            self.fft_in[i][1] = dat_q;
+        }
+
+        fftw.fftw_execute(self.fft_plan);
+
+        const half = self.fft_size / 2;
+        const n_sq: f64 = self.fft_size * self.fft_size;
+
+        for (0..self.fft_size) |i| {
+            const src = (i + half) % self.fft_size;
+            const re = self.fft_out[src][0];
+            const im = self.fft_out[src][1];
+
+            const power = (re * re + im * im) / n_sq;
+            self.fft_mag[i] = @floatCast(10.0 * @log10(@max(power, 1e-12)));
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
+        fftw.fftw_free(self.fft_in);
+        fftw.fftw_free(self.fft_out);
+        fftw.fftw_destroy_plan(self.fft_plan);
+        self.alloc.free(self.fft_mag);
+        self.alloc.free(self.fft_freqs);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
-    var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer allocator.deinit();
+    //var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    //defer allocator.deinit();
+
+    var allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(allocator.deinit() == .ok);
 
     const alloc = allocator.allocator();
 
-    // Allocate FFTW buffers for real-time FFT
-    const fft_in: *[FFT_SIZE]fftw.fftw_complex = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * FFT_SIZE)));
-    defer fftw.fftw_free(fft_in);
-
-    const fft_out: *[FFT_SIZE]fftw.fftw_complex = @ptrCast(@alignCast(fftw.fftw_malloc(@sizeOf(fftw.fftw_complex) * FFT_SIZE)));
-    defer fftw.fftw_free(fft_out);
-
-    const fft_plan = fftw.fftw_plan_dft_1d(FFT_SIZE, fft_in, fft_out, fftw.FFTW_FORWARD, fftw.FFTW_ESTIMATE);
-    defer fftw.fftw_destroy_plan(fft_plan);
-
-    // Magnitude (dB) and frequency axis buffers
-    const fft_mag: []f32 = try alloc.alloc(f32, FFT_SIZE);
-    const fft_freqs: []f32 = try alloc.alloc(f32, FFT_SIZE);
-
-    // Pre-compute frequency axis (MHz) — fftshift so DC is in the center
-    const center_freq_mhz: f32 = 900.0;
-    const sample_rate_mhz: f32 = 1.0;
-    for (0..FFT_SIZE) |i| {
-        const bin: f32 = @as(f32, @floatFromInt(i)) - @as(f32, FFT_SIZE) / 2.0;
-        fft_freqs[i] = center_freq_mhz + bin * sample_rate_mhz / @as(f32, FFT_SIZE);
-    }
+    //
+    // Setup hackrf one
+    //
 
     try hackrf.init();
     defer hackrf.deinit() catch {};
@@ -119,9 +170,13 @@ pub fn main(init: std.process.Init) !void {
     var rx_buffer = try FixedSizeRingBuffer(hackrf.IQSample).init(alloc, mb(256));
     defer rx_buffer.deinit(alloc);
 
+    var rf_state = RFDataState.calc(512);
+    _ = rf_state;
+
     var rx_state = CallbackState{ .target_buffer = &rx_buffer, .should_stop = false, .mutex = std.Io.Mutex.init, .io = io };
 
     try device.startRx(*CallbackState, rxCallback, &rx_state);
+    const start_time: f64 = rl.GetTime();
 
     const screen_width = 800;
     const screen_height = 700;
@@ -129,10 +184,9 @@ pub fn main(init: std.process.Init) !void {
     rl.InitWindow(screen_width, screen_height, "rf-fun");
     defer rl.CloseWindow();
 
-    rl.SetTargetFPS(2);
-    const start_time: f64 = rl.GetTime();
+    rl.SetTargetFPS(60);
 
-    const samples_to_show = FFT_SIZE;
+    const samples_to_show = 1024;
     const samples: []hackrf.IQSample = try alloc.alloc(hackrf.IQSample, samples_to_show);
     defer alloc.free(samples);
 
@@ -143,12 +197,13 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(q_samples);
 
     var fft_plot = Plot.init(.{
-        .title = "FFT Spectrum",
+        .title = "1024 point FFT",
         .x_label = "Freq (MHz)",
         .y_label = "dB",
         .rect = .{ .x = 10, .y = 40, .width = @as(f32, screen_width - 20), .height = 512 },
         .y_range = .{ -120.0, 0.0 },
     });
+
 
     while (!rl.WindowShouldClose()) {
         // Update (zoom/pan/cursor input)
@@ -175,22 +230,6 @@ pub fn main(init: std.process.Init) !void {
             q_samples[i] = f[1];
         }
 
-        for (0..FFT_SIZE) |i| {
-            fft_in[i][0] = i_samples[i]; // real = I
-            fft_in[i][1] = q_samples[i]; // imag = Q
-        }
-        fftw.fftw_execute(fft_plan);
-
-        const half = FFT_SIZE / 2;
-        const n_sq: f64 = FFT_SIZE * FFT_SIZE;
-        for (0..FFT_SIZE) |i| {
-            const src = (i + half) % FFT_SIZE;
-            const re = fft_out[src][0];
-            const im = fft_out[src][1];
-            const power = (re * re + im * im) / n_sq;
-            fft_mag[i] = @floatCast(10.0 * @log10(@max(power, 1e-12)));
-        }
-
         fft_plot.clear();
         fft_plot.plotXY(fft_freqs, fft_mag, .{ .color = rl.SKYBLUE, .label = "Magnitude" });
 
@@ -214,4 +253,3 @@ pub fn main(init: std.process.Init) !void {
 
     rx_state.should_stop = true;
 }
-

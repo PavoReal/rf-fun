@@ -4,34 +4,83 @@ const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const plot = @import("plot.zig");
 const SimpleFFT = @import("simple_fft.zig").SimpleFFT;
 const util = @import("util.zig");
-
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
-
-// SDL3 GPU functions via C interop
 const c = @cImport({
     @cInclude("SDL3/SDL.h");
 });
 
-const RXCallbackState = struct {
-    mutex: std.Thread.Mutex = .{},
-    should_stop: bool = true,
-    bytes_transfered: u64 = 0,
-    target_buffer: *FixedSizeRingBuffer(hackrf.IQSample),
-};
-
-fn rxCallback(trans: hackrf.Transfer, state: *RXCallbackState) hackrf.StreamAction {
+fn sdrRxCallback(trans: hackrf.Transfer, state: *SDR) hackrf.StreamAction {
     state.mutex.lock();
     defer state.mutex.unlock();
 
     const valid_length = trans.validLength();
-    state.bytes_transfered += valid_length;
+    state.rx_bytes_received += valid_length;
 
-    state.target_buffer.append(trans.iqSamples());
+    const raw_samples = trans.iqSamples();
 
-    if (state.should_stop) return .stop;
+    std.log.debug("callback", .{});
+    for (raw_samples) |sample| {
+        state.rx_buffer.appendOne(sample.toFloat());
+    }
+
+    if (!state.rx_running) return .stop;
     return .@"continue";
 }
+
+const SDR = struct {
+    const Self = @This();
+
+    device: hackrf.Device = undefined,
+    connected: bool = false,
+    version_str: [256]u8 = std.mem.zeroes([256]u8),
+
+    fs: f64 = util.mhz(20),
+    cf: u64 = util.ghz(0.9),
+
+    mutex: std.Thread.Mutex = .{},
+
+    rx_running: bool = false,
+    rx_bytes_received: u64 = 0,
+
+    rx_buffer: FixedSizeRingBuffer([2]f32) = undefined,
+
+    pub fn init(alloc: std.mem.Allocator, cf: u64, fs: f64) !Self {
+        var self = Self{};
+        self.cf = cf;
+        self.fs = fs;
+        try hackrf.init();
+
+        var list = try hackrf.DeviceList.get();
+        defer list.deinit();
+
+        if (list.count() == 0) return self;
+
+        self.device = try hackrf.Device.open();
+        _ = try self.device.versionStringRead(&self.version_str);
+
+        self.device.stopTx() catch {};
+        try self.device.setSampleRate(self.fs);
+        try self.device.setFreq(self.cf);
+        try self.device.setAmpEnable(true);
+
+        self.rx_buffer = try FixedSizeRingBuffer([2]f32).init(alloc, util.mb(256));
+
+        return self;
+    }
+
+    pub fn startRx(self: *Self) !void {
+        self.rx_running = true;
+        try self.device.startRx(*Self, sdrRxCallback, self);
+    }
+
+    pub fn deinit(self: *Self, alloc: std.mem.Allocator) !void {
+        self.rx_buffer.deinit(alloc);
+        self.device.close();
+
+        try hackrf.deinit();
+    }
+};
 
 pub fn main() !void {
     var allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -42,45 +91,7 @@ pub fn main() !void {
     //
     // Setup hackrf one
     //
-
-    try hackrf.init();
-    defer hackrf.deinit() catch {};
-
-    var list = try hackrf.DeviceList.get();
-    defer list.deinit();
-
-    if (list.count() == 0) {
-        std.log.err("Failed to find hackrf device", .{});
-        return;
-    }
-
-    const device = try hackrf.Device.open();
-    defer device.close();
-
-    var version_buf: [256]u8 = undefined;
-    const version = try device.versionStringRead(&version_buf);
-
-    std.log.debug("Found hackrf device running firmware {s}", .{version});
-
-    const fs = util.mhz(10);
-    const center_freq = util.ghz(0.9);
-
-    device.stopTx() catch {};
-    try device.setSampleRate(fs);
-    try device.setFreq(center_freq);
-    try device.setAmpEnable(true);
-
-    std.log.debug("hackrf config done", .{});
-
-    var rx_buffer = try FixedSizeRingBuffer(hackrf.IQSample).init(alloc, util.mb(256));
-    defer rx_buffer.deinit(alloc);
-
-    var rx_state = RXCallbackState{
-        .target_buffer = &rx_buffer,
-        .should_stop = false,
-    };
-
-    try device.startRx(*RXCallbackState, rxCallback, &rx_state);
+    var sdr: ?SDR = null;
 
     //
     // SDL3 + GPU init
@@ -131,11 +142,27 @@ pub fn main() !void {
     //
     // FFT setup
     //
+    
+    const default_cf = util.mhz(900);
+    const default_fs = util.mhz(20);
 
-    var fft = try SimpleFFT.init(alloc, 512, center_freq, fs);
+    const sample_rate_values = [_]f64{ util.mhz(2), util.mhz(4), util.mhz(8), util.mhz(10), util.mhz(16), util.mhz(20) };
+    const sample_rate_labels: [:0]const u8 = "2 MHz\x004 MHz\x008 MHz\x0010 MHz\x0016 MHz\x0020 MHz";
+
+    const fft_size_values = [_]u32{ 64, 128, 256, 512, 1024, 2048, 4096 };
+    const fft_size_labels: [:0]const u8 = "64\x00128\x00256\x00512\x001024\x002048\x004096";
+
+    var cf_slider: f32 = @as(f32, @floatFromInt(@as(u32, @intCast(default_cf)))) / 1e6;
+    var fs_index: i32 = 5; // default = 20 MHz
+    var fft_size_index: i32 = 3; // default = 512
+
+    var fft = try SimpleFFT.init(alloc, 512, default_cf, default_fs);
     defer fft.deinit(alloc);
 
-    var next_fft_update_time = zsdl.getTicks() + 500; // ms
+    var fft_buf: [4096][2]f32 = undefined;
+
+    const next_fft_update_delay = 100;
+    var next_fft_update_time = zsdl.getTicks() + next_fft_update_delay; // ms
 
     //
     // Main loop
@@ -152,20 +179,25 @@ pub fn main() !void {
             }
         }
 
-        // FFT update
-        const current_time = zsdl.getTicks();
-        if (current_time >= next_fft_update_time) {
-            rx_state.mutex.lock();
-            defer rx_state.mutex.unlock();
+        if (sdr != null) {
+            // FFT update
+            const current_time = zsdl.getTicks();
+            if (current_time >= next_fft_update_time) {
+                sdr.?.mutex.lock();
+                defer sdr.?.mutex.unlock();
 
-            std.log.debug("fft update", .{});
-            next_fft_update_time = current_time + 500;
+                const fft_slice = fft_buf[0..fft.fft_size];
+                const copied = sdr.?.rx_buffer.copyNewest(fft_slice);
+                if (copied == fft.fft_size) {
+                    fft.calc(fft_slice);
+                }
+
+                next_fft_update_time = current_time + next_fft_update_delay;
+            }
         }
 
-        // Acquire GPU command buffer
         const cmd_buf = c.SDL_AcquireGPUCommandBuffer(gpu_device) orelse continue;
 
-        // Acquire swapchain texture
         var swapchain_texture: ?*c.SDL_GPUTexture = null;
         var sw_w: u32 = 0;
         var sw_h: u32 = 0;
@@ -179,16 +211,13 @@ pub fn main() !void {
             continue;
         }
 
-        // Calculate pixel scale for high-DPI
         var win_w: c_int = 0;
         var win_h: c_int = 0;
         zsdl.getWindowSize(window, &win_w, &win_h) catch {};
         const fb_scale: f32 = if (win_w > 0) @as(f32, @floatFromInt(sw_w)) / @as(f32, @floatFromInt(win_w)) else 1.0;
 
-        // Begin ImGui frame
         zgui.backend.newFrame(sw_w, sw_h, fb_scale);
 
-        // ImGui content
         {
             const viewport = zgui.getMainViewport();
             const work_pos = viewport.getWorkPos();
@@ -206,19 +235,57 @@ pub fn main() !void {
                     .no_bring_to_front_on_focus = true,
                 },
             })) {
-                zgui.text("FPS: {d:.0}", .{zgui.io.getFramerate()});
-                plot.render("512 point FFT", "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 });
+                if (sdr != null) {
+                    if (zgui.button("Disconnect", .{})) {
+                        sdr.?.rx_running = false;
+                        try sdr.?.deinit(alloc);
+                        sdr = null;
+
+                        @memset(fft.fft_mag, 0);
+                    } else {
+                        zgui.text("hackrf firmware verison {s}", .{sdr.?.version_str});
+                        if (zgui.sliderFloat("Center Freq (MHz)", .{ .min = 0, .max = 6000, .v = &cf_slider })) {
+                            const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
+                            try sdr.?.device.setFreq(cf_hz);
+                            fft.updateFreqs(cf_slider * 1e6, @floatCast(sample_rate_values[@intCast(fs_index)]));
+                        }
+                        if (zgui.combo("Sample Rate", .{
+                            .current_item = &fs_index,
+                            .items_separated_by_zeros = sample_rate_labels,
+                        })) {
+                            const new_fs = sample_rate_values[@intCast(fs_index)];
+                            try sdr.?.device.setSampleRate(new_fs);
+                            fft.updateFreqs(cf_slider * 1e6, @floatCast(new_fs));
+                        }
+                        if (zgui.combo("FFT Size", .{
+                            .current_item = &fft_size_index,
+                            .items_separated_by_zeros = fft_size_labels,
+                        })) {
+                            const new_size = fft_size_values[@intCast(fft_size_index)];
+                            const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
+                            fft.deinit(alloc);
+                            fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz));
+                        }
+                    }
+                } else {
+                    if (zgui.button("Connect", .{})) {
+                        const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
+                        const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
+                        sdr = try SDR.init(alloc, cf_hz, fs_hz);
+                        try sdr.?.startRx();
+                        fft.updateFreqs(cf_slider * 1e6, @floatCast(fs_hz));
+                    }
+                }
+                var title_buf: [64]u8 = undefined;
+                const plot_title = std.fmt.bufPrintZ(&title_buf, "{d} point FFT", .{fft.fft_size}) catch "FFT";
+                plot.render(plot_title, "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 });
             }
             zgui.end();
         }
 
-        // Finalize ImGui rendering
         zgui.backend.render();
-
-        // Prepare ImGui draw data (uploads to GPU before render pass)
         zgui.backend.prepareDrawData(@ptrCast(cmd_buf));
 
-        // Begin render pass
         const color_target = c.SDL_GPUColorTargetInfo{
             .texture = swapchain_texture,
             .mip_level = 0,
@@ -241,9 +308,12 @@ pub fn main() !void {
             c.SDL_EndGPURenderPass(render_pass);
         }
 
-        // Submit
         _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
     }
 
-    rx_state.should_stop = true;
+    if (sdr != null) {
+        sdr.?.rx_running = false;
+        try sdr.?.deinit(alloc);
+    }
 }
+

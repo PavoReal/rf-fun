@@ -45,6 +45,12 @@ pub fn FixedSizeRingBuffer(comptime T: type) type {
             self.count = @min(self.count + items.len, cap);
         }
 
+        pub fn appendOne(self: *Self, item: T) void {
+            self.buf[self.head] = item;
+            self.head = (self.head + 1) % self.buf.len;
+            if (self.count < self.buf.len) self.count += 1;
+        }
+
         pub fn capacity(self: Self) usize {
             return self.buf.len;
         }
@@ -95,6 +101,17 @@ pub fn FixedSizeRingBuffer(comptime T: type) type {
             }
             const from_first = want - s.second.len;
             return .{ .first = s.first[s.first.len - from_first ..], .second = s.second };
+        }
+
+        /// Copy up to `dest.len` of the newest elements into `dest` contiguously.
+        /// Returns the number of elements actually copied.
+        pub fn copyNewest(self: Self, dest: []T) usize {
+            const want = @min(dest.len, self.count);
+            if (want == 0) return 0;
+            const s = self.newest(want);
+            @memcpy(dest[0..s.first.len], s.first);
+            @memcpy(dest[s.first.len..][0..s.second.len], s.second);
+            return want;
         }
     };
 }
@@ -365,6 +382,51 @@ test "oldest and newest agree on full buffer" {
     const all_oldest = collectSlices(rb.oldest(4), &buf_o);
     const all_newest = collectSlices(rb.newest(4), &buf_n);
     try testing.expectEqualSlices(u8, all_oldest, all_newest);
+}
+
+// === copyNewest tests ===
+
+test "copyNewest basic, no wrap" {
+    var rb = try RingBuf.init(testing.allocator, 8);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 10, 20, 30, 40, 50 });
+    var dest: [3]u8 = undefined;
+    const n = rb.copyNewest(&dest);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualSlices(u8, &.{ 30, 40, 50 }, &dest);
+}
+
+test "copyNewest with wrap-around" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2, 3, 4, 5, 6 });
+    // contents oldest→newest: [3, 4, 5, 6]
+    var dest: [3]u8 = undefined;
+    const n = rb.copyNewest(&dest);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, &dest);
+}
+
+test "copyNewest under-filled buffer" {
+    var rb = try RingBuf.init(testing.allocator, 8);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2 });
+    var dest: [5]u8 = undefined;
+    const n = rb.copyNewest(&dest);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u8, dest[0..2], &.{ 1, 2 });
+}
+
+test "copyNewest empty buffer" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    var dest: [4]u8 = undefined;
+    const n = rb.copyNewest(&dest);
+    try testing.expectEqual(@as(usize, 0), n);
 }
 
 test "works with extern struct type" {

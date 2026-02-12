@@ -97,6 +97,10 @@ pub fn clear(self: *Plot) void {
     self.series_count = 0;
 }
 
+pub fn setRect(self: *Plot, rect: rl.Rectangle) void {
+    self.config.rect = rect;
+}
+
 // ── Input handling ───────────────────────────────────────
 
 pub fn update(self: *Plot) void {

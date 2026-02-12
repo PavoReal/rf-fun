@@ -211,10 +211,11 @@ pub fn build(b: *std.Build) void {
         exe.root_module.addIncludePath(b.path("deps/fftw-3.3.5-dll64"));
         exe.root_module.addLibraryPath(b.path("deps/fftw-3.3.5-dll64"));
         b.installBinFile("deps/fftw-3.3.5-dll64/libfftw3-3.dll", "libfftw3-3.dll");
+        
+        exe.root_module.linkSystemLibrary("libfftw3-3", .{.needed = true});
+    } else if (is_darwin) {
+        exe.root_module.linkSystemLibrary("fftw3", .{.needed = true});
     }
-
-    exe.root_module.linkSystemLibrary("libfftw3-3", .{.needed = true});
-
 
     b.installArtifact(exe);
 

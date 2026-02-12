@@ -4,12 +4,7 @@
 This ia a zig project meant to explore and learn about the  handling of rf data from a hackrf one. 
 
 ### Zig
-Running zig version 0.16 master branch, updated often, always refer to the
-following web pages before writing or reading any zig code:
-- Language reference: https://ziglang.org/documentation/master/
-- std lib reference: https://ziglang.org/documentation/master/std/
-- When build errors occur, check the actual Zig 0.16 API rather than guessing from older versions.
-- For C interop (@cImport), be aware of type incompatibilities between separate compilation units.
+Running zig version 0.15.2.
 
 ## Claude's Workflow
 1. Start every complex task in plan mode. Pour your energy into the plan so

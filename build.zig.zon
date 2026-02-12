@@ -48,6 +48,21 @@
             .url = "git+https://github.com/zig-gamedev/zsdl?ref=main#537de39b5719f39dcd612df2923607f3aedaf147",
             .hash = "zsdl-0.4.0-dev-rFpjEzgIXwBdDmlda0YnQPRVApMc1YEgbyzLWuT9GupM",
         },
+        .sdl3_prebuilt_macos = .{
+            .url = "https://github.com/zig-gamedev/sdl3-prebuilt-macos/archive/e89207914a0f0163c0fb543da4f530f645ef5969.tar.gz",
+            .hash = "sdl3_prebuilt_macos-0.2.0-dev-A1UBS1aUdwCWfplgS5fNorbstvDxSi3LOHnSPzjmWZhl",
+            .lazy = true,
+        },
+        .sdl3_prebuilt_x86_64_windows_gnu = .{
+            .url = "https://github.com/zig-gamedev/sdl3-prebuilt-x86_64-windows-gnu/archive/8f5dc1a9c9450ac578286e90d4667fc3aa1b23e2.tar.gz",
+            .hash = "sdl3_prebuilt_x86_64_windows_gnu-0.2.0-dev-AAAAAI_mJADlsRyMxRFKobQJEbfs1p-37A9mmYEj7DW-",
+            .lazy = true,
+        },
+        .sdl3_prebuilt_x86_64_linux_gnu = .{
+            .url = "https://github.com/zig-gamedev/sdl3-prebuilt-x86_64-linux-gnu/archive/b19959ed3aa87d8393640d7ba3aec142ae85487b.tar.gz",
+            .hash = "sdl3_prebuilt_x86_64_linux_gnu-0.2.0-dev-qpwWsmyVNwBHzXjgC9Z-U02SXoUVMMxvCnI7XKocDcDn",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

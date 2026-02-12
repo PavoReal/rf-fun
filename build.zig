@@ -164,13 +164,22 @@ pub fn build(b: *std.Build) void {
     });
 
     //
-    // Build raylib from source (uses fork's Zig 0.16-compatible build.zig)
+    // zgui (ImGui + ImPlot) with SDL3 GPU backend
     //
-    const raylib_dep = b.dependency("raylib", .{
+    const zgui_dep = b.dependency("zgui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .sdl3_gpu,
+        .with_implot = true,
+    });
+
+    //
+    // zsdl (SDL3)
+    //
+    const zsdl_dep = b.dependency("zsdl", .{
         .target = target,
         .optimize = optimize,
     });
-    const raylib = raylib_dep.artifact("raylib");
 
     //
     // root module
@@ -204,8 +213,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkLibrary(libhackrf);
     exe.root_module.addIncludePath(hackrf_dep.path("host/libhackrf/src"));
 
-    exe.root_module.linkLibrary(raylib);
-    exe.root_module.addIncludePath(raylib_dep.path("src"));
+    exe.root_module.addImport("zgui", zgui_dep.module("root"));
+    exe.root_module.linkLibrary(zgui_dep.artifact("imgui"));
+
+    exe.root_module.addImport("zsdl3", zsdl_dep.module("zsdl3"));
+
+    // Link SDL3 (system-installed via homebrew/package manager)
+    exe.root_module.linkSystemLibrary("SDL3", .{});
 
     if (os_tag == .windows) {
         exe.root_module.addIncludePath(b.path("deps/fftw-3.3.5-dll64"));

@@ -25,7 +25,7 @@
     .fingerprint = 0xc62ce60eebe23890, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0-dev.2349+204fa8959",
+    .minimum_zig_version = "0.15.2",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -40,9 +40,13 @@
             .url = "https://github.com/libusb/libusb/archive/refs/tags/v1.0.27.tar.gz",
             .hash = "N-V-__8AAGSMGgDb5aXYKy35qSci9DNnFT7K51Y6qzdhG82Z",
         },
-        .raylib = .{
-            .url = "https://github.com/PavoReal/raylib-zig-0.16/archive/refs/heads/master.zip",
-            .hash = "raylib-5.6.0-dev-whq8uNkuDQX9lIXcfJBAb-aMM2-g3NrQR_IUKOouAku6",
+        .zgui = .{
+            .url = "git+https://github.com/zig-gamedev/zgui?ref=main#d9e7b7f78c66113f7e8193a92b6df2d7157dad54",
+            .hash = "zgui-0.6.0-dev--L6sZBwNbgDQ972BBK7975zsIGG1ODTS33kcTMQfh3km",
+        },
+        .zsdl = .{
+            .url = "git+https://github.com/zig-gamedev/zsdl?ref=main#537de39b5719f39dcd612df2923607f3aedaf147",
+            .hash = "zsdl-0.4.0-dev-rFpjEzgIXwBdDmlda0YnQPRVApMc1YEgbyzLWuT9GupM",
         },
     },
     .paths = .{

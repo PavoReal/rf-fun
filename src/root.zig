@@ -756,12 +756,7 @@ fn skipIfNoHardware() error{SkipZigTest}!void {
 
 fn txTestsEnabled() bool {
     // Check for TX test enable env var - default to disabled for safety
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
-    var map = std.process.Environ.createMap(std.process.Environ.empty, gpa) catch return false;
-    defer map.deinit();
-    return map.get("HACKRF_TEST_TX") != null;
+    return std.posix.getenv("HACKRF_TEST_TX") != null;
 }
 
 fn skipIfTxDisabled() error{SkipZigTest}!void {

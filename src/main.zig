@@ -291,8 +291,8 @@ pub fn main() !void {
     createWaterfallTexture(gpu_device, default_fft_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
     defer destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
 
-    const next_fft_update_delay = 100; // ms
-    var next_fft_update_time = zsdl.getTicks() + next_fft_update_delay;
+    var next_fft_update_delay: i32 = 50; // ms
+    var next_fft_update_time = zsdl.getTicks() + @as(u64, @intCast(next_fft_update_delay));
 
     //
     // Main loop
@@ -334,7 +334,7 @@ pub fn main() !void {
                         waterfall.pushRow(fft.fft_mag);
                     }
 
-                    next_fft_update_time = current_time + next_fft_update_delay;
+                    next_fft_update_time = current_time + @as(u64, @intCast(next_fft_update_delay));
                 }
             }
         }
@@ -342,7 +342,7 @@ pub fn main() !void {
         {
             //
             // Waterfall view update
-            // 
+            //
 
             // Upload waterfall pixels to GPU if dirty
             if (waterfall.dirty and wf_transfer_buf != null) {
@@ -380,20 +380,11 @@ pub fn main() !void {
             zgui.backend.newFrame(sw_w, sw_h, fb_scale);
 
             {
-                const viewport = zgui.getMainViewport();
-                //const work_pos = viewport.getWorkPos();
-                const work_size = viewport.getWorkSize();
-
-                zgui.setNextWindowPos(.{ .x = 0, .y = 0 });
-                zgui.setNextWindowSize(.{ .h = work_size[1] * 0.25, .w = work_size[0] });
+                zgui.setNextWindowPos(.{ .x = 174, .y = 109, .cond = .first_use_ever });
+                zgui.setNextWindowSize(.{ .w = 509, .h = 270, .cond = .first_use_ever });
 
                 if (zgui.begin("Config", .{
-                    .flags = .{
-                        .no_collapse = true,
-                        .no_resize = true,
-                        .no_move = true,
-                        .no_title_bar = true
-                    },
+                    .flags = .{},
                 })) {
                     if (sdr != null) {
                         if (zgui.button("Disconnect", .{})) {
@@ -441,6 +432,8 @@ pub fn main() !void {
                                 createWaterfallTexture(gpu_device, new_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
                             }
 
+                            _ = zgui.sliderInt("FFT Update Delay (ms)", .{.min = 0, .max = 500, .v = &next_fft_update_delay});
+
                             // Waterfall dB range sliders
                             zgui.separatorText("Waterfall");
                             if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &waterfall.db_min })) {
@@ -462,16 +455,11 @@ pub fn main() !void {
                 }
                 zgui.end();
 
-                zgui.setNextWindowPos(.{ .x = 0, .y = work_size[1] * 0.25 });
-                zgui.setNextWindowSize(.{ .h = work_size[1] * 0.75, .w = work_size[0] });
+                zgui.setNextWindowPos(.{ .x = 683, .y = 109, .cond = .first_use_ever });
+                zgui.setNextWindowSize(.{ .w = 1149, .h = 810, .cond = .first_use_ever });
 
-                if (zgui.begin("Data", .{
-                    .flags = .{
-                        .no_move = true,
-                        .no_resize = true,
-                        .no_collapse = true,
-                        .no_title_bar = true,
-                    },
+                if (zgui.begin("Data View", .{
+                    .flags = .{},
                 })) {
                     const avail = zgui.getContentRegionAvail();
                     const line_h = avail[1] * 0.35;

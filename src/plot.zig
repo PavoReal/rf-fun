@@ -10,7 +10,7 @@ pub fn render(
     refit_x: bool,
     height: f32,
 ) void {
-    if (zgui.plot.beginPlot(title, .{ .w = -1.0, .h = height, .flags = .{ .crosshairs = true } })) {
+    if (zgui.plot.beginPlot(title, .{ .w = -1.0, .h = height, .flags = .{ .crosshairs = true, .no_legend = true } })) {
         defer zgui.plot.endPlot();
 
         zgui.plot.setupAxis(.x1, .{ .label = x_label });

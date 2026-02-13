@@ -8,8 +8,9 @@ pub fn render(
     y_data: []const f32,
     y_range: ?[2]f64,
     refit_x: bool,
+    height: f32,
 ) void {
-    if (zgui.plot.beginPlot(title, .{ .w = -1.0, .h = -1.0, .flags = .{ .crosshairs = true } })) {
+    if (zgui.plot.beginPlot(title, .{ .w = -1.0, .h = height, .flags = .{ .crosshairs = true } })) {
         defer zgui.plot.endPlot();
 
         zgui.plot.setupAxis(.x1, .{ .label = x_label });

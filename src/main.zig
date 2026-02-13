@@ -3,6 +3,7 @@ const hackrf = @import("rf_fun");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const plot = @import("plot.zig");
 const SimpleFFT = @import("simple_fft.zig").SimpleFFT;
+const Waterfall = @import("waterfall.zig").Waterfall;
 const util = @import("util.zig");
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
@@ -81,6 +82,122 @@ const SDR = struct {
     }
 };
 
+fn createWaterfallTexture(
+    device: *c.SDL_GPUDevice,
+    width: u32,
+    height: u32,
+    out_tex: *?*c.SDL_GPUTexture,
+    out_sampler: *?*c.SDL_GPUSampler,
+    out_transfer: *?*c.SDL_GPUTransferBuffer,
+    out_w: *u32,
+    out_h: *u32,
+    out_binding: *c.SDL_GPUTextureSamplerBinding,
+) void {
+    const tex_info = c.SDL_GPUTextureCreateInfo{
+        .type = c.SDL_GPU_TEXTURETYPE_2D,
+        .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = width,
+        .height = height,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+        .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+        .props = 0,
+    };
+    out_tex.* = c.SDL_CreateGPUTexture(device, &tex_info);
+
+    const sampler_info = c.SDL_GPUSamplerCreateInfo{
+        .min_filter = c.SDL_GPU_FILTER_NEAREST,
+        .mag_filter = c.SDL_GPU_FILTER_NEAREST,
+        .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+        .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .mip_lod_bias = 0,
+        .max_anisotropy = 1,
+        .compare_op = 0,
+        .min_lod = 0,
+        .max_lod = 0,
+        .enable_anisotropy = false,
+        .enable_compare = false,
+        .padding1 = 0,
+        .padding2 = 0,
+        .props = 0,
+    };
+    out_sampler.* = c.SDL_CreateGPUSampler(device, &sampler_info);
+
+    const transfer_info = c.SDL_GPUTransferBufferCreateInfo{
+        .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size = width * height * 4,
+        .props = 0,
+    };
+    out_transfer.* = c.SDL_CreateGPUTransferBuffer(device, &transfer_info);
+
+    out_w.* = width;
+    out_h.* = height;
+    out_binding.texture = out_tex.*;
+    out_binding.sampler = out_sampler.*;
+}
+
+fn destroyWaterfallTexture(
+    device: *c.SDL_GPUDevice,
+    tex: *?*c.SDL_GPUTexture,
+    sampler: *?*c.SDL_GPUSampler,
+    transfer: *?*c.SDL_GPUTransferBuffer,
+) void {
+    if (tex.*) |t| c.SDL_ReleaseGPUTexture(device, t);
+    if (sampler.*) |s| c.SDL_ReleaseGPUSampler(device, s);
+    if (transfer.*) |tb| c.SDL_ReleaseGPUTransferBuffer(device, tb);
+    tex.* = null;
+    sampler.* = null;
+    transfer.* = null;
+}
+
+fn uploadWaterfallTexture(
+    device: *c.SDL_GPUDevice,
+    waterfall: *Waterfall,
+    tex: ?*c.SDL_GPUTexture,
+    transfer_buf: ?*c.SDL_GPUTransferBuffer,
+    tex_w: u32,
+    tex_h: u32,
+) void {
+    const tb = transfer_buf orelse return;
+    const texture = tex orelse return;
+
+    const mapped: ?[*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(device, tb, false));
+    if (mapped) |ptr| {
+        const byte_count = tex_w * tex_h * 4;
+        @memcpy(ptr[0..byte_count], waterfall.pixels[0..byte_count]);
+        c.SDL_UnmapGPUTransferBuffer(device, tb);
+    }
+
+    const cmd_buf = c.SDL_AcquireGPUCommandBuffer(device) orelse return;
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buf) orelse return;
+
+    const src = c.SDL_GPUTextureTransferInfo{
+        .transfer_buffer = tb,
+        .offset = 0,
+        .pixels_per_row = tex_w,
+        .rows_per_layer = tex_h,
+    };
+
+    const dst = c.SDL_GPUTextureRegion{
+        .texture = texture,
+        .mip_level = 0,
+        .layer = 0,
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .w = tex_w,
+        .h = tex_h,
+        .d = 1,
+    };
+
+    c.SDL_UploadToGPUTexture(copy_pass, &src, &dst, false);
+    c.SDL_EndGPUCopyPass(copy_pass);
+    _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
+}
+
 pub fn main() !void {
     var allocator: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(allocator.deinit() == .ok);
@@ -152,11 +269,27 @@ pub fn main() !void {
 
     var refit_x = true;
 
-    var fft = try SimpleFFT.init(alloc, default_fft_size, default_cf, default_fs);
+    var fft = try SimpleFFT.init(alloc, default_fft_size, default_cf, default_fs, .NONE);
     defer fft.deinit(alloc);
 
     var fft_buf: [][2]f32 = try alloc.alloc([2]f32, default_fft_size);
     defer alloc.free(fft_buf);
+
+    // Waterfall state
+    var waterfall = try Waterfall.init(alloc, default_fft_size, 256);
+    defer waterfall.deinit(alloc);
+
+    // SDL3 GPU texture state for waterfall
+    var wf_gpu_texture: ?*c.SDL_GPUTexture = null;
+    var wf_sampler: ?*c.SDL_GPUSampler = null;
+    var wf_transfer_buf: ?*c.SDL_GPUTransferBuffer = null;
+    var wf_tex_w: u32 = 0;
+    var wf_tex_h: u32 = 0;
+    var wf_binding: c.SDL_GPUTextureSamplerBinding = .{ .texture = null, .sampler = null };
+
+    // Create initial waterfall texture
+    createWaterfallTexture(gpu_device, default_fft_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
+    defer destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
 
     const next_fft_update_delay = 100; // ms
     var next_fft_update_time = zsdl.getTicks() + next_fft_update_delay;
@@ -198,10 +331,23 @@ pub fn main() !void {
 
                     if (copied == fft.fft_size) {
                         fft.calc(fft_slice);
+                        waterfall.pushRow(fft.fft_mag);
                     }
 
                     next_fft_update_time = current_time + next_fft_update_delay;
                 }
+            }
+        }
+
+        {
+            //
+            // Waterfall view update
+            // 
+
+            // Upload waterfall pixels to GPU if dirty
+            if (waterfall.dirty and wf_transfer_buf != null) {
+                waterfall.renderPixels();
+                uploadWaterfallTexture(gpu_device, &waterfall, wf_gpu_texture, wf_transfer_buf, wf_tex_w, wf_tex_h);
             }
         }
 
@@ -256,6 +402,7 @@ pub fn main() !void {
                             sdr = null;
 
                             @memset(fft.fft_mag, 0);
+                            waterfall.clear();
                         } else {
                             zgui.text("hackrf firmware verison {s}", .{sdr.?.version_str});
 
@@ -283,9 +430,24 @@ pub fn main() !void {
                                 const new_size = fft_size_values[@intCast(fft_size_index)];
                                 const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
                                 fft.deinit(alloc);
-                                fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz));
+                                fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz), .NONE);
 
                                 fft_buf = try alloc.realloc(fft_buf, new_size);
+
+                                // Recreate waterfall for new FFT size
+                                waterfall.deinit(alloc);
+                                waterfall = try Waterfall.init(alloc, new_size, 256);
+                                destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
+                                createWaterfallTexture(gpu_device, new_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
+                            }
+
+                            // Waterfall dB range sliders
+                            zgui.separatorText("Waterfall");
+                            if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &waterfall.db_min })) {
+                                waterfall.dirty = true;
+                            }
+                            if (zgui.sliderFloat("dB Max", .{ .min = -160, .max = 0, .v = &waterfall.db_max })) {
+                                waterfall.dirty = true;
                             }
                         }
                     } else {
@@ -308,11 +470,25 @@ pub fn main() !void {
                         .no_move = true,
                         .no_resize = true,
                         .no_collapse = true,
-                        .no_title_bar = true
+                        .no_title_bar = true,
                     },
                 })) {
-                    plot.render("FFT", "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 }, refit_x);
+                    const avail = zgui.getContentRegionAvail();
+                    const line_h = avail[1] * 0.35;
+                    const wf_h = avail[1] * 0.60;
+
+                    // FFT line plot (top portion)
+                    plot.render("FFT", "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 }, refit_x, line_h);
                     refit_x = false;
+
+                    // Waterfall image (bottom portion)
+                    if (wf_binding.texture != null) {
+                        const tex_ref = zgui.TextureRef{
+                            .tex_data = null,
+                            .tex_id = @enumFromInt(@intFromPtr(&wf_binding)),
+                        };
+                        zgui.image(tex_ref, .{ .w = avail[0], .h = wf_h });
+                    }
                 }
                 zgui.end();
             }

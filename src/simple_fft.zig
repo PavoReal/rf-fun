@@ -5,6 +5,8 @@ const fftw = @cImport({
     @cInclude("fftw3.h");
 });
 
+const WindowType = enum { NONE, BLACKMANHARRIS };
+
 pub const SimpleFFT = struct {
     const Self = @This();
 
@@ -14,11 +16,13 @@ pub const SimpleFFT = struct {
     fft_plan: fftw.fftwf_plan = undefined,
     fft_mag: []f32 = undefined,
     fft_freqs: []f32 = undefined,
+    window_func_type: WindowType = WindowType.NONE,
 
-    pub fn init(alloc: std.mem.Allocator, fft_size: u32, center_freq: f32, fs: f32) !Self {
+    pub fn init(alloc: std.mem.Allocator, fft_size: u32, center_freq: f32, fs: f32, window: WindowType) !Self {
         var self: Self = .{};
 
         self.fft_size = fft_size;
+        self.window_func_type = window;
 
         if (self.fft_size == 0) {
             return self;
@@ -31,6 +35,7 @@ pub const SimpleFFT = struct {
         self.fft_freqs = try alloc.alloc(f32, self.fft_size);
 
         self.updateFreqs(center_freq, fs);
+        self.calcWindowCoef();
 
         return self;
     }
@@ -42,6 +47,15 @@ pub const SimpleFFT = struct {
         for (0..self.fft_size) |i| {
             const bin: f32 = @as(f32, @floatFromInt(i)) - fft_size_f32 / 2.0;
             self.fft_freqs[i] = center_freq_mhz + bin * sample_rate_mhz / fft_size_f32;
+        }
+    }
+
+    fn calcBlackmanHarris(_: *Self) void {}
+
+    pub fn calcWindowCoef(self: *Self) void {
+        switch (self.window_func_type) {
+            .NONE => return,
+            .BLACKMANHARRIS => self.calcBlackmanHarris(),
         }
     }
 

@@ -137,7 +137,6 @@ pub fn main() !void {
 
     const default_cf = util.ghz(2.4);
     const default_fs = util.mhz(20);
-    const default_fft_size = 2048;
 
     const sample_rate_values = [_]f64{ util.mhz(2), util.mhz(4), util.mhz(8), util.mhz(10), util.mhz(16), util.mhz(20) };
     const sample_rate_labels: [:0]const u8 = "2 MHz\x004 MHz\x008 MHz\x0010 MHz\x0016 MHz\x0020 MHz";
@@ -147,7 +146,9 @@ pub fn main() !void {
 
     var cf_slider: f32 = @as(f32, @floatFromInt(@as(u32, @intCast(default_cf)))) / util.mhz(1);
     var fs_index: i32 = 5;
-    var fft_size_index: i32 = 5;
+    var fft_size_index: i32 = 7;
+
+    const default_fft_size = fft_size_values[@intCast(fft_size_index)];
 
     var refit_x = true;
 
@@ -166,157 +167,183 @@ pub fn main() !void {
 
     var running = true;
     while (running) {
-        // Event polling
-        var event: zsdl.Event = undefined;
-        while (zsdl.pollEvent(&event)) {
-            _ = zgui.backend.processEvent(@ptrCast(&event));
-            if (event.type == .quit) {
-                running = false;
-            }
-        }
+        {
+            //
+            // Handle OS events
+            //
 
-        if (sdr != null) {
-            // FFT update
-            const current_time = zsdl.getTicks();
-            if (current_time >= next_fft_update_time) {
-                const fft_slice = fft_buf[0..fft.fft_size];
-
-                sdr.?.mutex.lock();
-                const copied = sdr.?.rx_buffer.copyNewest(fft_slice);
-                sdr.?.mutex.unlock();
-
-                if (copied == fft.fft_size) {
-                    fft.calc(fft_slice);
+            var event: zsdl.Event = undefined;
+            while (zsdl.pollEvent(&event)) {
+                _ = zgui.backend.processEvent(@ptrCast(&event));
+                if (event.type == .quit) {
+                    running = false;
                 }
-
-                next_fft_update_time = current_time + next_fft_update_delay;
             }
         }
-
-        const cmd_buf = c.SDL_AcquireGPUCommandBuffer(gpu_device) orelse continue;
-
-        var swapchain_texture: ?*c.SDL_GPUTexture = null;
-        var sw_w: u32 = 0;
-        var sw_h: u32 = 0;
-        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(cmd_buf, @ptrCast(window), &swapchain_texture, &sw_w, &sw_h)) {
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
-            continue;
-        }
-
-        if (swapchain_texture == null) {
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
-            continue;
-        }
-
-        var win_w: c_int = 0;
-        var win_h: c_int = 0;
-        zsdl.getWindowSize(window, &win_w, &win_h) catch {};
-        const fb_scale: f32 = if (win_w > 0) @as(f32, @floatFromInt(sw_w)) / @as(f32, @floatFromInt(win_w)) else 1.0;
-
-        zgui.backend.newFrame(sw_w, sw_h, fb_scale);
 
         {
-            const viewport = zgui.getMainViewport();
-            const work_pos = viewport.getWorkPos();
-            const work_size = viewport.getWorkSize();
+            //
+            // SDR Update
+            //
 
-            if (zgui.begin("Config", .{})) {
-                if (sdr != null) {
-                    if (zgui.button("Disconnect", .{})) {
-                        sdr.?.rx_running = false;
-                        try sdr.?.deinit(alloc);
-                        sdr = null;
+            if (sdr != null) {
+                // FFT update
+                const current_time = zsdl.getTicks();
+                if (current_time >= next_fft_update_time) {
+                    const fft_slice = fft_buf[0..fft.fft_size];
 
-                        @memset(fft.fft_mag, 0);
-                    } else {
-                        zgui.text("hackrf firmware verison {s}", .{sdr.?.version_str});
+                    sdr.?.mutex.lock();
+                    const copied = sdr.?.rx_buffer.copyNewest(fft_slice);
+                    sdr.?.mutex.unlock();
 
-                        if (zgui.sliderFloat("Center Freq (MHz)", .{ .min = 0, .max = 6000, .v = &cf_slider })) {
-                            const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
-                            try sdr.?.device.setFreq(cf_hz);
-                            fft.updateFreqs(cf_slider * 1e6, @floatCast(sample_rate_values[@intCast(fs_index)]));
-                            refit_x = true;
-                        }
-
-                        if (zgui.combo("Sample Rate", .{
-                            .current_item = &fs_index,
-                            .items_separated_by_zeros = sample_rate_labels,
-                        })) {
-                            const new_fs = sample_rate_values[@intCast(fs_index)];
-                            try sdr.?.device.setSampleRate(new_fs);
-                            fft.updateFreqs(cf_slider * 1e6, @floatCast(new_fs));
-                            refit_x = true;
-                        }
-
-                        if (zgui.combo("FFT Size", .{
-                            .current_item = &fft_size_index,
-                            .items_separated_by_zeros = fft_size_labels,
-                        })) {
-                            const new_size = fft_size_values[@intCast(fft_size_index)];
-                            const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
-                            fft.deinit(alloc);
-                            fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz));
-
-                            fft_buf = try alloc.realloc(fft_buf, new_size);
-                        }
+                    if (copied == fft.fft_size) {
+                        fft.calc(fft_slice);
                     }
-                } else {
-                    if (zgui.button("Connect", .{})) {
-                        const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
-                        const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
-                        sdr = try SDR.init(alloc, cf_hz, fs_hz);
-                        try sdr.?.startRx();
-                        fft.updateFreqs(cf_slider * 1e6, @floatCast(fs_hz));
-                    }
+
+                    next_fft_update_time = current_time + next_fft_update_delay;
                 }
             }
-            zgui.end();
+        }
 
-            _ = work_pos;
-            zgui.setNextWindowPos(.{ .x = 0, .y = work_size[1] / 2 });
-            zgui.setNextWindowSize(.{ .h = work_size[1] / 2, .w = work_size[0]});
+        {
+            //
+            // Render
+            //
 
-            if (zgui.begin("Data", .{
-                .flags = .{
-                    .no_move = true,
-                    .no_resize = true,
-                    .no_collapse = true,
-                },
-            })) {
-                var title_buf: [64]u8 = undefined;
-                const plot_title = std.fmt.bufPrintZ(&title_buf, "{d} point FFT", .{fft.fft_size}) catch "FFT";
-                plot.render(plot_title, "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 }, refit_x);
-                refit_x = false;
+            const cmd_buf = c.SDL_AcquireGPUCommandBuffer(gpu_device) orelse continue;
+
+            var swapchain_texture: ?*c.SDL_GPUTexture = null;
+            var sw_w: u32 = 0;
+            var sw_h: u32 = 0;
+
+            if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(cmd_buf, @ptrCast(window), &swapchain_texture, &sw_w, &sw_h)) {
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
+                continue;
             }
-            zgui.end();
+
+            if (swapchain_texture == null) {
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
+                continue;
+            }
+
+            var win_w: c_int = 0;
+            var win_h: c_int = 0;
+            zsdl.getWindowSize(window, &win_w, &win_h) catch {};
+            const fb_scale: f32 = if (win_w > 0) @as(f32, @floatFromInt(sw_w)) / @as(f32, @floatFromInt(win_w)) else 1.0;
+
+            zgui.backend.newFrame(sw_w, sw_h, fb_scale);
+
+            {
+                const viewport = zgui.getMainViewport();
+                //const work_pos = viewport.getWorkPos();
+                const work_size = viewport.getWorkSize();
+
+                zgui.setNextWindowPos(.{ .x = 0, .y = 0 });
+                zgui.setNextWindowSize(.{ .h = work_size[1] * 0.25, .w = work_size[0] });
+
+                if (zgui.begin("Config", .{
+                    .flags = .{
+                        .no_collapse = true,
+                        .no_resize = true,
+                        .no_move = true,
+                        .no_title_bar = true
+                    },
+                })) {
+                    if (sdr != null) {
+                        if (zgui.button("Disconnect", .{})) {
+                            sdr.?.rx_running = false;
+                            try sdr.?.deinit(alloc);
+                            sdr = null;
+
+                            @memset(fft.fft_mag, 0);
+                        } else {
+                            zgui.text("hackrf firmware verison {s}", .{sdr.?.version_str});
+
+                            if (zgui.sliderFloat("Center Freq (MHz)", .{ .min = 0, .max = 6000, .v = &cf_slider })) {
+                                const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
+                                try sdr.?.device.setFreq(cf_hz);
+                                fft.updateFreqs(cf_slider * 1e6, @floatCast(sample_rate_values[@intCast(fs_index)]));
+                                refit_x = true;
+                            }
+
+                            if (zgui.combo("Sample Rate", .{
+                                .current_item = &fs_index,
+                                .items_separated_by_zeros = sample_rate_labels,
+                            })) {
+                                const new_fs = sample_rate_values[@intCast(fs_index)];
+                                try sdr.?.device.setSampleRate(new_fs);
+                                fft.updateFreqs(cf_slider * 1e6, @floatCast(new_fs));
+                                refit_x = true;
+                            }
+
+                            if (zgui.combo("FFT Size", .{
+                                .current_item = &fft_size_index,
+                                .items_separated_by_zeros = fft_size_labels,
+                            })) {
+                                const new_size = fft_size_values[@intCast(fft_size_index)];
+                                const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
+                                fft.deinit(alloc);
+                                fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz));
+
+                                fft_buf = try alloc.realloc(fft_buf, new_size);
+                            }
+                        }
+                    } else {
+                        if (zgui.button("Connect", .{})) {
+                            const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
+                            const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
+                            sdr = try SDR.init(alloc, cf_hz, fs_hz);
+                            try sdr.?.startRx();
+                            fft.updateFreqs(cf_slider * 1e6, @floatCast(fs_hz));
+                        }
+                    }
+                }
+                zgui.end();
+
+                zgui.setNextWindowPos(.{ .x = 0, .y = work_size[1] * 0.25 });
+                zgui.setNextWindowSize(.{ .h = work_size[1] * 0.75, .w = work_size[0] });
+
+                if (zgui.begin("Data", .{
+                    .flags = .{
+                        .no_move = true,
+                        .no_resize = true,
+                        .no_collapse = true,
+                        .no_title_bar = true
+                    },
+                })) {
+                    plot.render("FFT", "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 }, refit_x);
+                    refit_x = false;
+                }
+                zgui.end();
+            }
+
+            zgui.backend.render();
+            zgui.backend.prepareDrawData(@ptrCast(cmd_buf));
+
+            const color_target = c.SDL_GPUColorTargetInfo{
+                .texture = swapchain_texture,
+                .mip_level = 0,
+                .layer_or_depth_plane = 0,
+                .clear_color = .{ .r = 0.12, .g = 0.12, .b = 0.12, .a = 1.0 },
+                .load_op = c.SDL_GPU_LOADOP_CLEAR,
+                .store_op = c.SDL_GPU_STOREOP_STORE,
+                .resolve_texture = null,
+                .resolve_mip_level = 0,
+                .resolve_layer = 0,
+                .cycle = false,
+                .cycle_resolve_texture = false,
+                .padding1 = 0,
+                .padding2 = 0,
+            };
+
+            const render_pass = c.SDL_BeginGPURenderPass(cmd_buf, &color_target, 1, null);
+            if (render_pass != null) {
+                zgui.backend.renderDrawData(@ptrCast(cmd_buf), @ptrCast(render_pass.?), null);
+                c.SDL_EndGPURenderPass(render_pass);
+            }
+
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
         }
-
-        zgui.backend.render();
-        zgui.backend.prepareDrawData(@ptrCast(cmd_buf));
-
-        const color_target = c.SDL_GPUColorTargetInfo{
-            .texture = swapchain_texture,
-            .mip_level = 0,
-            .layer_or_depth_plane = 0,
-            .clear_color = .{ .r = 0.12, .g = 0.12, .b = 0.12, .a = 1.0 },
-            .load_op = c.SDL_GPU_LOADOP_CLEAR,
-            .store_op = c.SDL_GPU_STOREOP_STORE,
-            .resolve_texture = null,
-            .resolve_mip_level = 0,
-            .resolve_layer = 0,
-            .cycle = false,
-            .cycle_resolve_texture = false,
-            .padding1 = 0,
-            .padding2 = 0,
-        };
-
-        const render_pass = c.SDL_BeginGPURenderPass(cmd_buf, &color_target, 1, null);
-        if (render_pass != null) {
-            zgui.backend.renderDrawData(@ptrCast(cmd_buf), @ptrCast(render_pass.?), null);
-            c.SDL_EndGPURenderPass(render_pass);
-        }
-
-        _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
     }
 
     if (sdr != null) {

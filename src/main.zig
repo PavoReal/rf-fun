@@ -5,6 +5,7 @@ const plot = @import("plot.zig");
 const SimpleFFT = @import("simple_fft.zig").SimpleFFT;
 const WindowType = @import("simple_fft.zig").WindowType;
 const Waterfall = @import("waterfall.zig").Waterfall;
+const bands = @import("bands.zig");
 const util = @import("util.zig");
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
@@ -333,6 +334,12 @@ pub fn main() !void {
     var window_index: i32 = 3; // BLACKMAN_HARRIS
 
     //
+    // Band overlay state
+    //
+    var show_bands: bool = true;
+    var band_categories_enabled = [_]bool{true} ** bands.category_count;
+
+    //
     // Main loop
     //
 
@@ -573,6 +580,27 @@ pub fn main() !void {
                                 waterfall.rebuildLut();
                                 waterfall.dirty = true;
                             }
+
+                            // --- Band Overlay ---
+                            zgui.separatorText("Band Overlay");
+                            _ = zgui.checkbox("Show Bands", .{ .v = &show_bands });
+
+                            if (show_bands) {
+                                const fields = @typeInfo(bands.BandCategory).@"enum".fields;
+                                inline for (fields, 0..) |field, i| {
+                                    const cat: bands.BandCategory = @enumFromInt(field.value);
+                                    const col = bands.categoryColor(cat);
+                                    zgui.pushStyleColor4f(.{ .idx = .text, .c = col });
+                                    _ = zgui.checkbox(bands.categoryName(cat), .{ .v = &band_categories_enabled[i] });
+                                    zgui.popStyleColor(.{ .count = 1 });
+
+                                    // 2-column layout
+                                    if (i % 2 == 0 and i + 1 < fields.len) {
+                                        zgui.sameLine(.{});
+                                        zgui.setCursorPosX(zgui.getCursorPosX() + 20);
+                                    }
+                                }
+                            }
                         }
                     } else {
                         if (zgui.button("Connect", .{})) {
@@ -629,6 +657,27 @@ pub fn main() !void {
 
                     const overlay: ?[:0]const u8 = null;
 
+                    // Build band render entries (pre-filtered by enabled category and view range)
+                    var band_buf: [bands.all_bands.len]plot.BandRenderEntry = undefined;
+                    var band_count: usize = 0;
+                    if (show_bands) {
+                        // Use x_range for initial filter; once the user has panned
+                        // the plot limits will diverge, but x_range is our best pre-render guess
+                        const view_min: f32 = if (x_range) |xr| @floatCast(xr[0]) else 0;
+                        const view_max: f32 = if (x_range) |xr| @floatCast(xr[1]) else 6000;
+                        for (bands.all_bands) |band| {
+                            if (!band_categories_enabled[@intFromEnum(band.category)]) continue;
+                            if (band.end_mhz < view_min or band.start_mhz > view_max) continue;
+                            band_buf[band_count] = .{
+                                .start_mhz = band.start_mhz,
+                                .end_mhz = band.end_mhz,
+                                .label = band.label,
+                                .color = bands.categoryColor(band.category),
+                            };
+                            band_count += 1;
+                        }
+                    }
+
                     // FFT line plot (top portion)
                     const plot_result = plot.render(
                         "FFT",
@@ -640,6 +689,7 @@ pub fn main() !void {
                         refit_x,
                         line_h,
                         overlay,
+                        band_buf[0..band_count],
                     );
                     refit_x = false;
 

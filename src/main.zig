@@ -19,7 +19,6 @@ fn sdrRxCallback(trans: hackrf.Transfer, state: *SDR) hackrf.StreamAction {
 
     const raw_samples = trans.iqSamples();
 
-    std.log.debug("callback", .{});
     for (raw_samples) |sample| {
         state.rx_buffer.appendOne(sample.toFloat());
     }
@@ -88,9 +87,6 @@ pub fn main() !void {
 
     const alloc = allocator.allocator();
 
-    //
-    // Setup hackrf one
-    //
     var sdr: ?SDR = null;
 
     //
@@ -100,14 +96,10 @@ pub fn main() !void {
     try zsdl.init(.{ .video = true, .events = true });
     defer zsdl.quit();
 
-    const window = try zsdl.createWindow("rf-fun", 800, 700, .{ .resizable = true, .high_pixel_density = true });
+    const window = try zsdl.createWindow("rf-fun", 1920, 1080, .{ .resizable = true, .high_pixel_density = true });
     defer zsdl.destroyWindow(window);
 
-    const gpu_device = c.SDL_CreateGPUDevice(
-        c.SDL_GPU_SHADERFORMAT_METALLIB | c.SDL_GPU_SHADERFORMAT_SPIRV,
-        true,
-        null,
-    ) orelse {
+    const gpu_device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_METALLIB | c.SDL_GPU_SHADERFORMAT_SPIRV, true, null) orelse {
         std.log.err("Failed to create GPU device", .{});
         return;
     };
@@ -142,27 +134,31 @@ pub fn main() !void {
     //
     // FFT setup
     //
-    
-    const default_cf = util.mhz(900);
+
+    const default_cf = util.ghz(2.4);
     const default_fs = util.mhz(20);
+    const default_fft_size = 2048;
 
     const sample_rate_values = [_]f64{ util.mhz(2), util.mhz(4), util.mhz(8), util.mhz(10), util.mhz(16), util.mhz(20) };
     const sample_rate_labels: [:0]const u8 = "2 MHz\x004 MHz\x008 MHz\x0010 MHz\x0016 MHz\x0020 MHz";
 
-    const fft_size_values = [_]u32{ 64, 128, 256, 512, 1024, 2048, 4096 };
-    const fft_size_labels: [:0]const u8 = "64\x00128\x00256\x00512\x001024\x002048\x004096";
+    const fft_size_values = [_]u32{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
+    const fft_size_labels: [:0]const u8 = "64\x00128\x00256\x00512\x001024\x002048\x004096\x008192";
 
-    var cf_slider: f32 = @as(f32, @floatFromInt(@as(u32, @intCast(default_cf)))) / 1e6;
-    var fs_index: i32 = 5; // default = 20 MHz
-    var fft_size_index: i32 = 3; // default = 512
+    var cf_slider: f32 = @as(f32, @floatFromInt(@as(u32, @intCast(default_cf)))) / util.mhz(1);
+    var fs_index: i32 = 5;
+    var fft_size_index: i32 = 5;
 
-    var fft = try SimpleFFT.init(alloc, 512, default_cf, default_fs);
+    var refit_x = true;
+
+    var fft = try SimpleFFT.init(alloc, default_fft_size, default_cf, default_fs);
     defer fft.deinit(alloc);
 
-    var fft_buf: [4096][2]f32 = undefined;
+    var fft_buf: [][2]f32 = try alloc.alloc([2]f32, default_fft_size);
+    defer alloc.free(fft_buf);
 
-    const next_fft_update_delay = 100;
-    var next_fft_update_time = zsdl.getTicks() + next_fft_update_delay; // ms
+    const next_fft_update_delay = 100; // ms
+    var next_fft_update_time = zsdl.getTicks() + next_fft_update_delay;
 
     //
     // Main loop
@@ -183,11 +179,12 @@ pub fn main() !void {
             // FFT update
             const current_time = zsdl.getTicks();
             if (current_time >= next_fft_update_time) {
-                sdr.?.mutex.lock();
-                defer sdr.?.mutex.unlock();
-
                 const fft_slice = fft_buf[0..fft.fft_size];
+
+                sdr.?.mutex.lock();
                 const copied = sdr.?.rx_buffer.copyNewest(fft_slice);
+                sdr.?.mutex.unlock();
+
                 if (copied == fft.fft_size) {
                     fft.calc(fft_slice);
                 }
@@ -223,18 +220,7 @@ pub fn main() !void {
             const work_pos = viewport.getWorkPos();
             const work_size = viewport.getWorkSize();
 
-            zgui.setNextWindowPos(.{ .x = work_pos[0], .y = work_pos[1] });
-            zgui.setNextWindowSize(.{ .w = work_size[0], .h = work_size[1] });
-
-            if (zgui.begin("rf-fun", .{
-                .flags = .{
-                    .no_title_bar = true,
-                    .no_resize = true,
-                    .no_move = true,
-                    .no_collapse = true,
-                    .no_bring_to_front_on_focus = true,
-                },
-            })) {
+            if (zgui.begin("Config", .{})) {
                 if (sdr != null) {
                     if (zgui.button("Disconnect", .{})) {
                         sdr.?.rx_running = false;
@@ -244,11 +230,14 @@ pub fn main() !void {
                         @memset(fft.fft_mag, 0);
                     } else {
                         zgui.text("hackrf firmware verison {s}", .{sdr.?.version_str});
+
                         if (zgui.sliderFloat("Center Freq (MHz)", .{ .min = 0, .max = 6000, .v = &cf_slider })) {
                             const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
                             try sdr.?.device.setFreq(cf_hz);
                             fft.updateFreqs(cf_slider * 1e6, @floatCast(sample_rate_values[@intCast(fs_index)]));
+                            refit_x = true;
                         }
+
                         if (zgui.combo("Sample Rate", .{
                             .current_item = &fs_index,
                             .items_separated_by_zeros = sample_rate_labels,
@@ -256,7 +245,9 @@ pub fn main() !void {
                             const new_fs = sample_rate_values[@intCast(fs_index)];
                             try sdr.?.device.setSampleRate(new_fs);
                             fft.updateFreqs(cf_slider * 1e6, @floatCast(new_fs));
+                            refit_x = true;
                         }
+
                         if (zgui.combo("FFT Size", .{
                             .current_item = &fft_size_index,
                             .items_separated_by_zeros = fft_size_labels,
@@ -265,6 +256,8 @@ pub fn main() !void {
                             const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
                             fft.deinit(alloc);
                             fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz));
+
+                            fft_buf = try alloc.realloc(fft_buf, new_size);
                         }
                     }
                 } else {
@@ -276,9 +269,24 @@ pub fn main() !void {
                         fft.updateFreqs(cf_slider * 1e6, @floatCast(fs_hz));
                     }
                 }
+            }
+            zgui.end();
+
+            _ = work_pos;
+            zgui.setNextWindowPos(.{ .x = 0, .y = work_size[1] / 2 });
+            zgui.setNextWindowSize(.{ .h = work_size[1] / 2, .w = work_size[0]});
+
+            if (zgui.begin("Data", .{
+                .flags = .{
+                    .no_move = true,
+                    .no_resize = true,
+                    .no_collapse = true,
+                },
+            })) {
                 var title_buf: [64]u8 = undefined;
                 const plot_title = std.fmt.bufPrintZ(&title_buf, "{d} point FFT", .{fft.fft_size}) catch "FFT";
-                plot.render(plot_title, "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 });
+                plot.render(plot_title, "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 }, refit_x);
+                refit_x = false;
             }
             zgui.end();
         }
@@ -316,4 +324,3 @@ pub fn main() !void {
         try sdr.?.deinit(alloc);
     }
 }
-

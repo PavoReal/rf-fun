@@ -1,39 +1,110 @@
 const zgui = @import("zgui");
 
+extern fn rfFunGetPlotLimits(x_min: *f64, x_max: *f64, y_min: *f64, y_max: *f64) void;
+
+pub const PlotSeries = struct {
+    label: [:0]const u8,
+    x_data: []const f32,
+    y_data: []const f32,
+    color: ?[4]f32 = null,
+    line_weight: f32 = -1.0,
+};
+
+pub const PlotLimits = struct { x_min: f64, x_max: f64 };
+
+pub const RenderResult = struct {
+    limits: PlotLimits,
+    hovered: bool,
+};
+
 pub fn render(
     title: [:0]const u8,
     x_label: [:0]const u8,
     y_label: [:0]const u8,
-    x_data: []const f32,
-    y_data: []const f32,
-    y_range: ?[2]f64,
+    series: []const PlotSeries,
+    y_range: [2]f64,
+    x_range: ?[2]f64,
     refit_x: bool,
     height: f32,
-) void {
-    if (zgui.plot.beginPlot(title, .{ .w = -1.0, .h = height, .flags = .{ .crosshairs = true, .no_legend = true } })) {
-        defer zgui.plot.endPlot();
+    overlay_text: ?[:0]const u8,
+) RenderResult {
+    var result = RenderResult{
+        .limits = .{ .x_min = 0, .x_max = 0 },
+        .hovered = false,
+    };
 
+    if (zgui.plot.beginPlot(title, .{ .w = -1.0, .h = height, .flags = .{ .crosshairs = true } })) {
         zgui.plot.setupAxis(.x1, .{ .label = x_label });
-        zgui.plot.setupAxis(.y1, .{ .label = y_label });
+        zgui.plot.setupAxis(.y1, .{
+            .label = y_label,
+            .flags = .{ .lock_min = true, .lock_max = true },
+        });
 
-        if (x_data.len > 0) {
+        // Y-axis: always locked
+        zgui.plot.setupAxisLimits(.y1, .{
+            .min = y_range[0],
+            .max = y_range[1],
+            .cond = .always,
+        });
+
+        // X-axis: refit when requested, otherwise user can pan/zoom
+        if (x_range) |xr| {
             zgui.plot.setupAxisLimits(.x1, .{
-                .min = @floatCast(x_data[0]),
-                .max = @floatCast(x_data[x_data.len - 1]),
+                .min = xr[0],
+                .max = xr[1],
                 .cond = if (refit_x) .always else .once,
             });
-        }
-
-        if (y_range) |yr| {
-            zgui.plot.setupAxisLimits(.y1, .{ .min = yr[0], .max = yr[1], .cond = .once });
         }
 
         zgui.plot.setupLegend(.{ .north = true, .east = true }, .{});
         zgui.plot.setupFinish();
 
-        zgui.plot.plotLine("Magnitude", f32, .{
-            .xv = x_data,
-            .yv = y_data,
-        });
+        for (series) |s| {
+            if (s.color) |col| {
+                zgui.plot.pushStyleColor4f(.{ .idx = .line, .c = col });
+            }
+            if (s.line_weight >= 0) {
+                zgui.plot.pushStyleVar1f(.{ .idx = .line_weight, .v = s.line_weight });
+            }
+
+            zgui.plot.plotLine(s.label, f32, .{
+                .xv = s.x_data,
+                .yv = s.y_data,
+            });
+
+            if (s.line_weight >= 0) {
+                zgui.plot.popStyleVar(.{});
+            }
+            if (s.color != null) {
+                zgui.plot.popStyleColor(.{});
+            }
+        }
+
+        if (overlay_text) |txt| {
+            // Place text at center of current plot
+            var xmin: f64 = 0;
+            var xmax: f64 = 0;
+            var ymin: f64 = 0;
+            var ymax: f64 = 0;
+            rfFunGetPlotLimits(&xmin, &xmax, &ymin, &ymax);
+            zgui.plot.plotText(txt, .{
+                .x = (xmin + xmax) / 2.0,
+                .y = (ymin + ymax) / 2.0,
+            });
+        }
+
+        result.hovered = zgui.plot.isPlotHovered();
+
+        // Read back plot limits before ending
+        var xmin: f64 = 0;
+        var xmax: f64 = 0;
+        var ymin: f64 = 0;
+        var ymax: f64 = 0;
+        rfFunGetPlotLimits(&xmin, &xmax, &ymin, &ymax);
+        result.limits = .{ .x_min = xmin, .x_max = xmax };
+
+        zgui.plot.endPlot();
     }
+
+    return result;
 }

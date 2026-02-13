@@ -216,6 +216,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zgui", zgui_dep.module("root"));
     exe.root_module.linkLibrary(zgui_dep.artifact("imgui"));
 
+    exe.root_module.addCSourceFiles(.{
+        .files = &.{"src/implot_extras.cpp"},
+        .flags = &.{"-std=c++11"},
+    });
+    exe.root_module.addIncludePath(zgui_dep.path("libs/imgui"));
+    exe.root_module.addIncludePath(zgui_dep.path("libs/implot"));
+
     exe.root_module.addImport("zsdl3", zsdl_dep.module("zsdl3"));
     exe.root_module.addIncludePath(zsdl_dep.path("libs/sdl3/include"));
 

@@ -3,6 +3,7 @@ const hackrf = @import("rf_fun");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const plot = @import("plot.zig");
 const SimpleFFT = @import("simple_fft.zig").SimpleFFT;
+const WindowType = @import("simple_fft.zig").WindowType;
 const Waterfall = @import("waterfall.zig").Waterfall;
 const util = @import("util.zig");
 const zsdl = @import("zsdl3");
@@ -295,6 +296,46 @@ pub fn main() !void {
     var next_fft_update_time = zsdl.getTicks() + @as(u64, @intCast(next_fft_update_delay));
 
     //
+    // RF Gain state
+    //
+    var lna_gain: i32 = 0; // 0-40, 8dB steps
+    var vga_gain: i32 = 0; // 0-62, 2dB steps
+    var amp_enable: bool = true;
+
+    //
+    // CF follow / debounce state
+    //
+    var pending_retune: bool = false;
+    var retune_deadline_ms: u64 = 0;
+    var retuning: bool = false;
+    var retune_settle_count: u32 = 0;
+    var last_plot_x_center: f64 = 0;
+
+    //
+    // Peak hold state
+    //
+    var peak_hold_enabled: bool = false;
+    var peak_hold_data: []f32 = try alloc.alloc(f32, default_fft_size);
+    defer alloc.free(peak_hold_data);
+    @memset(peak_hold_data, -200.0);
+    var peak_decay_rate: f32 = 20.0; // dB/s, 0 = classic hold (no decay)
+    var last_peak_time_ms: u64 = 0;
+
+    //
+    // EMA state
+    //
+    var avg_count: i32 = 1; // 1 = no averaging
+    var ema_data: []f32 = try alloc.alloc(f32, default_fft_size);
+    defer alloc.free(ema_data);
+    @memset(ema_data, -200.0);
+    var ema_initialized: bool = false;
+
+    //
+    // Window function state
+    //
+    var window_index: i32 = 0;
+
+    //
     // Main loop
     //
 
@@ -331,10 +372,73 @@ pub fn main() !void {
 
                     if (copied == fft.fft_size) {
                         fft.calc(fft_slice);
-                        waterfall.pushRow(fft.fft_mag);
+
+                        if (!retuning) {
+                            // EMA processing
+                            const alpha: f32 = 1.0 / @as(f32, @floatFromInt(avg_count));
+                            if (alpha < 1.0) {
+                                if (!ema_initialized) {
+                                    @memcpy(ema_data[0..fft.fft_size], fft.fft_mag[0..fft.fft_size]);
+                                    ema_initialized = true;
+                                } else {
+                                    for (0..fft.fft_size) |i| {
+                                        ema_data[i] = alpha * fft.fft_mag[i] + (1.0 - alpha) * ema_data[i];
+                                    }
+                                }
+                            }
+
+                            // Peak hold
+                            if (peak_hold_enabled) {
+                                const src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
+                                // Time-based decay
+                                const now_ms = zsdl.getTicks();
+                                if (last_peak_time_ms > 0 and peak_decay_rate > 0) {
+                                    const dt: f32 = @floatFromInt(now_ms - last_peak_time_ms);
+                                    const decay = peak_decay_rate * dt / 1000.0;
+                                    for (0..fft.fft_size) |i| {
+                                        peak_hold_data[i] -= decay;
+                                    }
+                                }
+                                last_peak_time_ms = now_ms;
+                                for (0..fft.fft_size) |i| {
+                                    peak_hold_data[i] = @max(peak_hold_data[i], src[i]);
+                                }
+                            }
+
+                            // Waterfall push
+                            const wf_src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
+                            waterfall.pushRow(wf_src);
+                        } else {
+                            // Retuning: count down settle cycles
+                            retune_settle_count -|= 1;
+                            if (retune_settle_count == 0) {
+                                retuning = false;
+                                ema_initialized = false;
+                            }
+                        }
                     }
 
                     next_fft_update_time = current_time + @as(u64, @intCast(next_fft_update_delay));
+                }
+
+                // Debounce retune check
+                if (pending_retune) {
+                    const now = zsdl.getTicks();
+                    if (now >= retune_deadline_ms) {
+                        pending_retune = false;
+                        // Compute new CF from plot center
+                        const new_cf_mhz = last_plot_x_center;
+                        const new_cf_hz: u64 = @intFromFloat(@max(0.0, new_cf_mhz * 1e6));
+                        if (new_cf_hz > 0) {
+                            sdr.?.device.setFreq(new_cf_hz) catch {};
+                            cf_slider = @floatCast(new_cf_mhz);
+                            fft.updateFreqs(@floatCast(new_cf_mhz * 1e6), @floatCast(sample_rate_values[@intCast(fs_index)]));
+                            retuning = true;
+                            retune_settle_count = 3;
+                            ema_initialized = false;
+                            refit_x = true;
+                        }
+                    }
                 }
             }
         }
@@ -381,7 +485,7 @@ pub fn main() !void {
 
             {
                 zgui.setNextWindowPos(.{ .x = 174, .y = 109, .cond = .first_use_ever });
-                zgui.setNextWindowSize(.{ .w = 509, .h = 270, .cond = .first_use_ever });
+                zgui.setNextWindowSize(.{ .w = 509, .h = 500, .cond = .first_use_ever });
 
                 if (zgui.begin("Config", .{
                     .flags = .{},
@@ -402,6 +506,9 @@ pub fn main() !void {
                                 try sdr.?.device.setFreq(cf_hz);
                                 fft.updateFreqs(cf_slider * 1e6, @floatCast(sample_rate_values[@intCast(fs_index)]));
                                 refit_x = true;
+                                pending_retune = false;
+                                retuning = false;
+                                ema_initialized = false;
                             }
 
                             if (zgui.combo("Sample Rate", .{
@@ -421,7 +528,7 @@ pub fn main() !void {
                                 const new_size = fft_size_values[@intCast(fft_size_index)];
                                 const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
                                 fft.deinit(alloc);
-                                fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz), .NONE);
+                                fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz), @enumFromInt(window_index));
 
                                 fft_buf = try alloc.realloc(fft_buf, new_size);
 
@@ -430,11 +537,64 @@ pub fn main() !void {
                                 waterfall = try Waterfall.init(alloc, new_size, 256);
                                 destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
                                 createWaterfallTexture(gpu_device, new_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
+
+                                // Realloc peak hold and EMA buffers
+                                peak_hold_data = try alloc.realloc(peak_hold_data, new_size);
+                                @memset(peak_hold_data, -200.0);
+
+                                ema_data = try alloc.realloc(ema_data, new_size);
+                                @memset(ema_data, -200.0);
+                                ema_initialized = false;
                             }
 
-                            _ = zgui.sliderInt("FFT Update Delay (ms)", .{.min = 0, .max = 500, .v = &next_fft_update_delay});
+                            _ = zgui.sliderInt("FFT Update Delay (ms)", .{ .min = 0, .max = 500, .v = &next_fft_update_delay });
 
-                            // Waterfall dB range sliders
+                            // --- RF Gain ---
+                            zgui.separatorText("RF Gain");
+
+                            if (zgui.sliderInt("LNA (dB)", .{ .min = 0, .max = 40, .v = &lna_gain })) {
+                                // Snap to 8dB steps
+                                lna_gain = @divTrunc(lna_gain + 4, 8) * 8;
+                                lna_gain = std.math.clamp(lna_gain, 0, 40);
+                                sdr.?.device.setLnaGain(@intCast(lna_gain)) catch {};
+                            }
+
+                            if (zgui.sliderInt("VGA (dB)", .{ .min = 0, .max = 62, .v = &vga_gain })) {
+                                // Snap to 2dB steps
+                                vga_gain = @divTrunc(vga_gain + 1, 2) * 2;
+                                vga_gain = std.math.clamp(vga_gain, 0, 62);
+                                sdr.?.device.setVgaGain(@intCast(vga_gain)) catch {};
+                            }
+
+                            if (zgui.checkbox("RF Amp (+14 dB)", .{ .v = &amp_enable })) {
+                                sdr.?.device.setAmpEnable(amp_enable) catch {};
+                            }
+
+                            // --- DSP ---
+                            zgui.separatorText("DSP");
+
+                            if (zgui.combo("Window", .{
+                                .current_item = &window_index,
+                                .items_separated_by_zeros = @import("simple_fft.zig").window_labels,
+                            })) {
+                                fft.setWindow(@enumFromInt(window_index));
+                            }
+
+                            if (zgui.sliderInt("Averages", .{ .min = 1, .max = 100, .v = &avg_count })) {
+                                if (avg_count <= 1) {
+                                    ema_initialized = false;
+                                }
+                            }
+
+                            _ = zgui.checkbox("Peak Hold", .{ .v = &peak_hold_enabled });
+                            zgui.sameLine(.{});
+                            if (zgui.button("Reset Peak", .{})) {
+                                @memset(peak_hold_data, -200.0);
+                                last_peak_time_ms = 0;
+                            }
+                            _ = zgui.sliderFloat("Peak Decay (dB/s)", .{ .min = 0, .max = 100, .v = &peak_decay_rate });
+
+                            // --- Waterfall ---
                             zgui.separatorText("Waterfall");
                             if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &waterfall.db_min })) {
                                 waterfall.dirty = true;
@@ -465,9 +625,66 @@ pub fn main() !void {
                     const line_h = avail[1] * 0.35;
                     const wf_h = avail[1] * 0.60;
 
+                    // Build series for plot
+                    const alpha: f32 = 1.0 / @as(f32, @floatFromInt(avg_count));
+                    const display_data = if (alpha < 1.0 and ema_initialized) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
+
+                    var series_buf: [2]plot.PlotSeries = undefined;
+                    var series_count: usize = 0;
+
+                    series_buf[series_count] = .{
+                        .label = "Magnitude",
+                        .x_data = fft.fft_freqs[0..fft.fft_size],
+                        .y_data = display_data,
+                    };
+                    series_count += 1;
+
+                    if (peak_hold_enabled) {
+                        series_buf[series_count] = .{
+                            .label = "Peak Hold",
+                            .x_data = fft.fft_freqs[0..fft.fft_size],
+                            .y_data = peak_hold_data[0..fft.fft_size],
+                            .color = .{ 1.0, 0.2, 0.2, 0.8 },
+                            .line_weight = 1.0,
+                        };
+                        series_count += 1;
+                    }
+
+                    // Compute x_range from frequency array
+                    const x_range: ?[2]f64 = if (fft.fft_freqs.len > 0) .{
+                        @floatCast(fft.fft_freqs[0]),
+                        @floatCast(fft.fft_freqs[fft.fft_size - 1]),
+                    } else null;
+
+                    const overlay: ?[:0]const u8 = if (retuning) "Retuning..." else null;
+
                     // FFT line plot (top portion)
-                    plot.render("FFT", "Freq (MHz)", "dB", fft.fft_freqs, fft.fft_mag, .{ -120.0, 0.0 }, refit_x, line_h);
+                    const plot_result = plot.render(
+                        "FFT",
+                        "Freq (MHz)",
+                        "dB",
+                        series_buf[0..series_count],
+                        .{ -120.0, 0.0 },
+                        x_range,
+                        refit_x,
+                        line_h,
+                        overlay,
+                    );
                     refit_x = false;
+
+                    // CF follow: detect horizontal pan
+                    if (sdr != null and plot_result.hovered) {
+                        const plot_center = (plot_result.limits.x_min + plot_result.limits.x_max) / 2.0;
+                        const cf_mhz: f64 = @floatCast(cf_slider);
+                        const diff = @abs(plot_center - cf_mhz);
+
+                        // Only trigger if meaningful shift (> 0.1 MHz)
+                        if (diff > 0.1) {
+                            last_plot_x_center = plot_center;
+                            pending_retune = true;
+                            retune_deadline_ms = zsdl.getTicks() + 200;
+                        }
+                    }
 
                     // Waterfall image (bottom portion)
                     if (wf_binding.texture != null) {

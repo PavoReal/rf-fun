@@ -1,6 +1,8 @@
 const zgui = @import("zgui");
 
 extern fn rfFunGetPlotLimits(x_min: *f64, x_max: *f64, y_min: *f64, y_max: *f64) void;
+extern fn rfFunGetPlotPos(x: *f32, y: *f32) void;
+extern fn rfFunGetPlotSize(w: *f32, h: *f32) void;
 
 pub const PlotSeries = struct {
     label: [:0]const u8,
@@ -15,6 +17,8 @@ pub const PlotLimits = struct { x_min: f64, x_max: f64 };
 pub const RenderResult = struct {
     limits: PlotLimits,
     hovered: bool,
+    plot_pos: [2]f32,
+    plot_size: [2]f32,
 };
 
 pub fn render(
@@ -31,6 +35,8 @@ pub fn render(
     var result = RenderResult{
         .limits = .{ .x_min = 0, .x_max = 0 },
         .hovered = false,
+        .plot_pos = .{ 0, 0 },
+        .plot_size = .{ 0, 0 },
     };
 
     if (zgui.plot.beginPlot(title, .{ .w = -1.0, .h = height, .flags = .{ .crosshairs = true } })) {
@@ -102,6 +108,10 @@ pub fn render(
         var ymax: f64 = 0;
         rfFunGetPlotLimits(&xmin, &xmax, &ymin, &ymax);
         result.limits = .{ .x_min = xmin, .x_max = xmax };
+
+        // Read back plot pixel position and size for alignment
+        rfFunGetPlotPos(&result.plot_pos[0], &result.plot_pos[1]);
+        rfFunGetPlotSize(&result.plot_size[0], &result.plot_size[1]);
 
         zgui.plot.endPlot();
     }

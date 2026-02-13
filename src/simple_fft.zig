@@ -13,7 +13,7 @@ pub const WindowType = enum(i32) {
     FLAT_TOP = 4,
 };
 
-pub const window_labels: [:0]const u8 = "None\x00Hanning\x00Hamming\x00Blackman-Harris\x00Flat-Top";
+pub const window_labels: [:0]const u8 = "None\x00Hanning\x00Hamming\x00Blackman-Harris\x00Flat-Top\x00";
 
 pub const SimpleFFT = struct {
     const Self = @This();

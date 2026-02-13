@@ -12,6 +12,7 @@ pub const Waterfall = struct {
     dirty: bool,
     db_min: f32,          // default -120
     db_max: f32,          // default 0
+    lut: [256][4]u8,
 
     pub fn init(alloc: std.mem.Allocator, fft_size: u32, history_len: u32) !Self {
         const total_bins = fft_size * history_len;
@@ -19,7 +20,7 @@ pub const Waterfall = struct {
         @memset(history, 0);
         const pixels = try alloc.alloc(u8, total_bins * 4);
         @memset(pixels, 0);
-        return Self{
+        var self = Self{
             .fft_size = fft_size,
             .history_len = history_len,
             .history = history,
@@ -29,7 +30,10 @@ pub const Waterfall = struct {
             .dirty = false,
             .db_min = -120.0,
             .db_max = 0.0,
+            .lut = undefined,
         };
+        self.rebuildLut();
+        return self;
     }
 
     pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
@@ -95,51 +99,49 @@ pub const Waterfall = struct {
         self.dirty = false;
     }
 
-    /// Jet-style colormap: dark blue → blue → green → yellow → red
+    /// Precompute 256-entry jet colormap LUT for current db_min/db_max.
+    /// Call after changing db_min or db_max.
+    pub fn rebuildLut(self: *Self) void {
+        for (0..256) |i| {
+            const t: f32 = @as(f32, @floatFromInt(i)) / 255.0;
+
+            // Jet colormap: dark blue → blue → green → yellow → red
+            var r: f32 = 0;
+            var g: f32 = 0;
+            var b: f32 = 0;
+
+            if (t < 0.25) {
+                const s = t / 0.25;
+                b = 32.0 + s * (255.0 - 32.0);
+            } else if (t < 0.5) {
+                const s = (t - 0.25) / 0.25;
+                g = s * 255.0;
+                b = 255.0 * (1.0 - s);
+            } else if (t < 0.75) {
+                const s = (t - 0.5) / 0.25;
+                r = s * 255.0;
+                g = 255.0;
+            } else {
+                const s = (t - 0.75) / 0.25;
+                r = 255.0;
+                g = 255.0 * (1.0 - s) + 48.0 * s;
+            }
+
+            self.lut[i] = .{
+                @intFromFloat(std.math.clamp(r, 0, 255)),
+                @intFromFloat(std.math.clamp(g, 0, 255)),
+                @intFromFloat(std.math.clamp(b, 0, 255)),
+                255,
+            };
+        }
+    }
+
+    /// Fast LUT-based colormap lookup
     fn dbToRgba(self: *const Self, db: f32) [4]u8 {
         const range = self.db_max - self.db_min;
-        const t = if (range > 0.0)
-            std.math.clamp((db - self.db_min) / range, 0.0, 1.0)
-        else
-            0.0;
-
-        // 5 keypoints:
-        // t=0.00 → (0, 0, 32)   dark blue
-        // t=0.25 → (0, 0, 255)  blue
-        // t=0.50 → (0, 255, 0)  green
-        // t=0.75 → (255, 255, 0) yellow
-        // t=1.00 → (255, 48, 0) red
-        var r: f32 = 0;
-        var g: f32 = 0;
-        var b: f32 = 0;
-
-        if (t < 0.25) {
-            const s = t / 0.25;
-            r = 0;
-            g = 0;
-            b = 32.0 + s * (255.0 - 32.0);
-        } else if (t < 0.5) {
-            const s = (t - 0.25) / 0.25;
-            r = 0;
-            g = s * 255.0;
-            b = 255.0 * (1.0 - s);
-        } else if (t < 0.75) {
-            const s = (t - 0.5) / 0.25;
-            r = s * 255.0;
-            g = 255.0;
-            b = 0;
-        } else {
-            const s = (t - 0.75) / 0.25;
-            r = 255.0;
-            g = 255.0 * (1.0 - s) + 48.0 * s;
-            b = 0;
-        }
-
-        return .{
-            @intFromFloat(std.math.clamp(r, 0, 255)),
-            @intFromFloat(std.math.clamp(g, 0, 255)),
-            @intFromFloat(std.math.clamp(b, 0, 255)),
-            255,
-        };
+        if (range <= 0.0) return self.lut[0];
+        const t = std.math.clamp((db - self.db_min) / range, 0.0, 1.0);
+        const idx: u8 = @intFromFloat(t * 255.0);
+        return self.lut[idx];
     }
 };

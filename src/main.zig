@@ -65,7 +65,7 @@ const SDR = struct {
         try self.device.setFreq(self.cf);
         try self.device.setAmpEnable(true);
 
-        self.rx_buffer = try FixedSizeRingBuffer([2]f32).init(alloc, util.mb(256));
+        self.rx_buffer = try FixedSizeRingBuffer([2]f32).init(alloc, util.mb(64));
 
         return self;
     }
@@ -257,14 +257,14 @@ pub fn main() !void {
     const default_fs = util.mhz(20);
 
     const sample_rate_values = [_]f64{ util.mhz(2), util.mhz(4), util.mhz(8), util.mhz(10), util.mhz(16), util.mhz(20) };
-    const sample_rate_labels: [:0]const u8 = "2 MHz\x004 MHz\x008 MHz\x0010 MHz\x0016 MHz\x0020 MHz";
+    const sample_rate_labels: [:0]const u8 = "2 MHz\x004 MHz\x008 MHz\x0010 MHz\x0016 MHz\x0020 MHz\x00";
 
     const fft_size_values = [_]u32{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
-    const fft_size_labels: [:0]const u8 = "64\x00128\x00256\x00512\x001024\x002048\x004096\x008192";
+    const fft_size_labels: [:0]const u8 = "64\x00128\x00256\x00512\x001024\x002048\x004096\x008192\x00";
 
     var cf_slider: f32 = @as(f32, @floatFromInt(@as(u32, @intCast(default_cf)))) / util.mhz(1);
     var fs_index: i32 = 5;
-    var fft_size_index: i32 = 7;
+    var fft_size_index: i32 = 6;
 
     const default_fft_size = fft_size_values[@intCast(fft_size_index)];
 
@@ -292,8 +292,9 @@ pub fn main() !void {
     createWaterfallTexture(gpu_device, default_fft_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
     defer destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
 
-    var next_fft_update_delay: i32 = 50; // ms
-    var next_fft_update_time = zsdl.getTicks() + @as(u64, @intCast(next_fft_update_delay));
+    var fft_target_fps: i32 = 60;
+    var fft_frame_interval_us: u64 = 1_000_000 / 60;
+    var last_fft_time_us: u64 = zsdl.getTicks() * 1000;
 
     //
     // RF Gain state
@@ -303,13 +304,9 @@ pub fn main() !void {
     var amp_enable: bool = true;
 
     //
-    // CF follow / debounce state
+    // CF follow / rate-limit state
     //
-    var pending_retune: bool = false;
-    var retune_deadline_ms: u64 = 0;
-    var retuning: bool = false;
-    var retune_settle_count: u32 = 0;
-    var last_plot_x_center: f64 = 0;
+    var last_retune_time_ms: u64 = 0;
 
     //
     // Peak hold state
@@ -318,13 +315,13 @@ pub fn main() !void {
     var peak_hold_data: []f32 = try alloc.alloc(f32, default_fft_size);
     defer alloc.free(peak_hold_data);
     @memset(peak_hold_data, -200.0);
-    var peak_decay_rate: f32 = 20.0; // dB/s, 0 = classic hold (no decay)
+    var peak_decay_rate: f32 = 1.6; // dB/s, 0 = classic hold (no decay)
     var last_peak_time_ms: u64 = 0;
 
     //
     // EMA state
     //
-    var avg_count: i32 = 1; // 1 = no averaging
+    var avg_count: i32 = 2; // 1 = no averaging
     var ema_data: []f32 = try alloc.alloc(f32, default_fft_size);
     defer alloc.free(ema_data);
     @memset(ema_data, -200.0);
@@ -333,7 +330,7 @@ pub fn main() !void {
     //
     // Window function state
     //
-    var window_index: i32 = 0;
+    var window_index: i32 = 3; // BLACKMAN_HARRIS
 
     //
     // Main loop
@@ -362,8 +359,9 @@ pub fn main() !void {
 
             if (sdr != null) {
                 // FFT update
-                const current_time = zsdl.getTicks();
-                if (current_time >= next_fft_update_time) {
+                const current_time_us = zsdl.getTicks() * 1000;
+                if (current_time_us - last_fft_time_us >= fft_frame_interval_us) {
+                    last_fft_time_us = current_time_us;
                     const fft_slice = fft_buf[0..fft.fft_size];
 
                     sdr.?.mutex.lock();
@@ -373,73 +371,44 @@ pub fn main() !void {
                     if (copied == fft.fft_size) {
                         fft.calc(fft_slice);
 
-                        if (!retuning) {
-                            // EMA processing
-                            const alpha: f32 = 1.0 / @as(f32, @floatFromInt(avg_count));
-                            if (alpha < 1.0) {
-                                if (!ema_initialized) {
-                                    @memcpy(ema_data[0..fft.fft_size], fft.fft_mag[0..fft.fft_size]);
-                                    ema_initialized = true;
-                                } else {
-                                    for (0..fft.fft_size) |i| {
-                                        ema_data[i] = alpha * fft.fft_mag[i] + (1.0 - alpha) * ema_data[i];
-                                    }
-                                }
-                            }
-
-                            // Peak hold
-                            if (peak_hold_enabled) {
-                                const src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
-                                // Time-based decay
-                                const now_ms = zsdl.getTicks();
-                                if (last_peak_time_ms > 0 and peak_decay_rate > 0) {
-                                    const dt: f32 = @floatFromInt(now_ms - last_peak_time_ms);
-                                    const decay = peak_decay_rate * dt / 1000.0;
-                                    for (0..fft.fft_size) |i| {
-                                        peak_hold_data[i] -= decay;
-                                    }
-                                }
-                                last_peak_time_ms = now_ms;
+                        // EMA processing
+                        const alpha: f32 = 1.0 / @as(f32, @floatFromInt(avg_count));
+                        if (alpha < 1.0) {
+                            if (!ema_initialized) {
+                                @memcpy(ema_data[0..fft.fft_size], fft.fft_mag[0..fft.fft_size]);
+                                ema_initialized = true;
+                            } else {
                                 for (0..fft.fft_size) |i| {
-                                    peak_hold_data[i] = @max(peak_hold_data[i], src[i]);
+                                    ema_data[i] = alpha * fft.fft_mag[i] + (1.0 - alpha) * ema_data[i];
                                 }
                             }
+                        }
 
-                            // Waterfall push
-                            const wf_src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
-                            waterfall.pushRow(wf_src);
-                        } else {
-                            // Retuning: count down settle cycles
-                            retune_settle_count -|= 1;
-                            if (retune_settle_count == 0) {
-                                retuning = false;
-                                ema_initialized = false;
+                        // Peak hold
+                        if (peak_hold_enabled) {
+                            const src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
+                            // Time-based decay
+                            const now_ms = zsdl.getTicks();
+                            if (last_peak_time_ms > 0 and peak_decay_rate > 0) {
+                                const dt: f32 = @floatFromInt(now_ms - last_peak_time_ms);
+                                const decay = peak_decay_rate * dt / 1000.0;
+                                for (0..fft.fft_size) |i| {
+                                    peak_hold_data[i] -= decay;
+                                }
+                            }
+                            last_peak_time_ms = now_ms;
+                            for (0..fft.fft_size) |i| {
+                                peak_hold_data[i] = @max(peak_hold_data[i], src[i]);
                             }
                         }
+
+                        // Waterfall push
+                        const wf_src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
+                        waterfall.pushRow(wf_src);
                     }
 
-                    next_fft_update_time = current_time + @as(u64, @intCast(next_fft_update_delay));
                 }
 
-                // Debounce retune check
-                if (pending_retune) {
-                    const now = zsdl.getTicks();
-                    if (now >= retune_deadline_ms) {
-                        pending_retune = false;
-                        // Compute new CF from plot center
-                        const new_cf_mhz = last_plot_x_center;
-                        const new_cf_hz: u64 = @intFromFloat(@max(0.0, new_cf_mhz * 1e6));
-                        if (new_cf_hz > 0) {
-                            sdr.?.device.setFreq(new_cf_hz) catch {};
-                            cf_slider = @floatCast(new_cf_mhz);
-                            fft.updateFreqs(@floatCast(new_cf_mhz * 1e6), @floatCast(sample_rate_values[@intCast(fs_index)]));
-                            retuning = true;
-                            retune_settle_count = 3;
-                            ema_initialized = false;
-                            refit_x = true;
-                        }
-                    }
-                }
             }
         }
 
@@ -487,7 +456,7 @@ pub fn main() !void {
                 zgui.setNextWindowPos(.{ .x = 174, .y = 109, .cond = .first_use_ever });
                 zgui.setNextWindowSize(.{ .w = 509, .h = 500, .cond = .first_use_ever });
 
-                if (zgui.begin("Config", .{
+                if (zgui.begin(zgui.formatZ("Config ({d:.0} fps)###Config", .{zgui.io.getFramerate()}), .{
                     .flags = .{},
                 })) {
                     if (sdr != null) {
@@ -506,8 +475,6 @@ pub fn main() !void {
                                 try sdr.?.device.setFreq(cf_hz);
                                 fft.updateFreqs(cf_slider * 1e6, @floatCast(sample_rate_values[@intCast(fs_index)]));
                                 refit_x = true;
-                                pending_retune = false;
-                                retuning = false;
                                 ema_initialized = false;
                             }
 
@@ -547,7 +514,9 @@ pub fn main() !void {
                                 ema_initialized = false;
                             }
 
-                            _ = zgui.sliderInt("FFT Update Delay (ms)", .{ .min = 0, .max = 500, .v = &next_fft_update_delay });
+                            if (zgui.sliderInt("FFT Rate (fps)", .{ .min = 1, .max = 120, .v = &fft_target_fps })) {
+                                fft_frame_interval_us = 1_000_000 / @as(u64, @intCast(@max(fft_target_fps, 1)));
+                            }
 
                             // --- RF Gain ---
                             zgui.separatorText("RF Gain");
@@ -597,9 +566,11 @@ pub fn main() !void {
                             // --- Waterfall ---
                             zgui.separatorText("Waterfall");
                             if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &waterfall.db_min })) {
+                                waterfall.rebuildLut();
                                 waterfall.dirty = true;
                             }
                             if (zgui.sliderFloat("dB Max", .{ .min = -160, .max = 0, .v = &waterfall.db_max })) {
+                                waterfall.rebuildLut();
                                 waterfall.dirty = true;
                             }
                         }
@@ -656,7 +627,7 @@ pub fn main() !void {
                         @floatCast(fft.fft_freqs[fft.fft_size - 1]),
                     } else null;
 
-                    const overlay: ?[:0]const u8 = if (retuning) "Retuning..." else null;
+                    const overlay: ?[:0]const u8 = null;
 
                     // FFT line plot (top portion)
                     const plot_result = plot.render(
@@ -672,27 +643,39 @@ pub fn main() !void {
                     );
                     refit_x = false;
 
-                    // CF follow: detect horizontal pan
+                    // CF follow: rate-limited retune on horizontal pan (max 10 Hz)
                     if (sdr != null and plot_result.hovered) {
                         const plot_center = (plot_result.limits.x_min + plot_result.limits.x_max) / 2.0;
                         const cf_mhz: f64 = @floatCast(cf_slider);
                         const diff = @abs(plot_center - cf_mhz);
 
-                        // Only trigger if meaningful shift (> 0.1 MHz)
                         if (diff > 0.1) {
-                            last_plot_x_center = plot_center;
-                            pending_retune = true;
-                            retune_deadline_ms = zsdl.getTicks() + 200;
+                            const now = zsdl.getTicks();
+                            if (now >= last_retune_time_ms + 100) {
+                                last_retune_time_ms = now;
+                                const new_cf_hz: u64 = @intFromFloat(@max(0.0, plot_center * 1e6));
+                                if (new_cf_hz > 0) {
+                                    sdr.?.device.setFreq(new_cf_hz) catch {};
+                                    cf_slider = @floatCast(plot_center);
+                                    fft.updateFreqs(@floatCast(plot_center * 1e6), @floatCast(sample_rate_values[@intCast(fs_index)]));
+                                    ema_initialized = false;
+                                    refit_x = true;
+                                }
+                            }
                         }
                     }
 
-                    // Waterfall image (bottom portion)
+                    // Waterfall image (bottom portion), aligned to FFT plot data area
                     if (wf_binding.texture != null) {
                         const tex_ref = zgui.TextureRef{
                             .tex_data = null,
                             .tex_id = @enumFromInt(@intFromPtr(&wf_binding)),
                         };
-                        zgui.image(tex_ref, .{ .w = avail[0], .h = wf_h });
+                        const window_pos = zgui.getWindowPos();
+                        const plot_left_local = plot_result.plot_pos[0] - window_pos[0];
+                        const waterfall_width = plot_result.plot_size[0];
+                        zgui.setCursorPosX(plot_left_local);
+                        zgui.image(tex_ref, .{ .w = waterfall_width, .h = wf_h });
                     }
                 }
                 zgui.end();

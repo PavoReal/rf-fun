@@ -8,6 +8,9 @@ const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const DspThread = @import("dsp/dsp_thread.zig").DspThread;
 const DcFilter = @import("dsp/dc_filter.zig").DcFilter;
 const DoubleBuffer = @import("dsp/double_buffer.zig").DoubleBuffer;
+const SignalStats = @import("signal_stats.zig").SignalStats;
+const PeakInfo = @import("signal_stats.zig").PeakInfo;
+const MAX_PEAKS = @import("signal_stats.zig").MAX_PEAKS;
 const zgui = @import("zgui");
 
 pub const fft_size_values = [_]u32{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
@@ -245,6 +248,9 @@ pub const SpectrumAnalyzer = struct {
 
     fft_freqs: []f32,
 
+    stats: SignalStats,
+    stats_scratch: []f32,
+
     pub fn init(
         alloc: std.mem.Allocator,
         fft_size_index: i32,
@@ -278,6 +284,9 @@ pub const SpectrumAnalyzer = struct {
         errdefer alloc.free(fft_freqs);
         computeFreqs(fft_freqs, fft_size, cf_mhz, fs_hz);
 
+        const stats_scratch = try alloc.alloc(f32, fft_size);
+        errdefer alloc.free(stats_scratch);
+
         dsp_thread.setTargetRate(30);
 
         return Self{
@@ -297,6 +306,8 @@ pub const SpectrumAnalyzer = struct {
             .waterfall = waterfall,
             .wf_history_len = wf_history,
             .fft_freqs = fft_freqs,
+            .stats = .{},
+            .stats_scratch = stats_scratch,
         };
     }
 
@@ -308,6 +319,7 @@ pub const SpectrumAnalyzer = struct {
         self.alloc.free(self.cached_display);
         self.alloc.free(self.cached_peak);
         self.alloc.free(self.fft_freqs);
+        self.alloc.free(self.stats_scratch);
     }
 
     pub fn startThread(self: *Self, mutex: *std.Thread.Mutex, rx_buffer: *FixedSizeRingBuffer(hackrf.IQSample)) !void {
@@ -327,6 +339,15 @@ pub const SpectrumAnalyzer = struct {
                 @memcpy(self.cached_peak[0..fft_size], frame.peak_hold);
                 self.waterfall.pushRow(frame.fft_mag_row);
                 self.has_frame = true;
+
+                const min_dist = SignalStats.minDistanceForWindow(self.window_index);
+                self.stats = SignalStats.compute(
+                    self.cached_display[0..fft_size],
+                    self.fft_freqs[0..fft_size],
+                    min_dist,
+                    self.stats_scratch[0..fft_size],
+                );
+
                 return true;
             }
         }
@@ -367,6 +388,9 @@ pub const SpectrumAnalyzer = struct {
 
         self.fft_freqs = try self.alloc.realloc(self.fft_freqs, new_size);
         computeFreqs(self.fft_freqs, new_size, cf_mhz, fs_hz);
+
+        self.stats_scratch = try self.alloc.realloc(self.stats_scratch, new_size);
+        self.stats = .{};
 
         self.has_frame = false;
 
@@ -426,62 +450,118 @@ pub const SpectrumAnalyzer = struct {
         zgui.setNextWindowSize(.{ .w = 340, .h = 400, .cond = .first_use_ever });
 
         if (zgui.begin(zgui.formatZ("Analysis ({d:.0} fps)###Analysis", .{fps}), .{})) {
-            if (zgui.combo("FFT Size", .{
-                .current_item = &self.fft_size_index,
-                .items_separated_by_zeros = fft_size_labels,
-            })) {
-                const new_size = try self.resize(self.fft_size_index, cf_mhz, fs_hz);
-                result.resized = true;
-                result.new_fft_size = new_size;
-            }
+            if (zgui.beginTabBar("analysis_tabs", .{})) {
+                defer zgui.endTabBar();
 
-            if (zgui.combo("Window", .{
-                .current_item = &self.window_index,
-                .items_separated_by_zeros = window_labels,
-            })) {
-                self.dsp_thread.worker.window_type.store(self.window_index, .release);
-                self.dsp_thread.worker.window_dirty.store(1, .release);
-            }
+                if (zgui.beginTabItem("Controls", .{})) {
+                    defer zgui.endTabItem();
 
-            if (zgui.sliderInt("Averages", .{ .min = 1, .max = 100, .v = &self.avg_count })) {
-                self.dsp_thread.worker.avg_count.store(self.avg_count, .release);
-                if (self.avg_count <= 1) {
-                    self.dsp_thread.worker.reset_requested.store(1, .release);
+                    if (zgui.combo("FFT Size", .{
+                        .current_item = &self.fft_size_index,
+                        .items_separated_by_zeros = fft_size_labels,
+                    })) {
+                        const new_size = try self.resize(self.fft_size_index, cf_mhz, fs_hz);
+                        result.resized = true;
+                        result.new_fft_size = new_size;
+                    }
+
+                    if (zgui.combo("Window", .{
+                        .current_item = &self.window_index,
+                        .items_separated_by_zeros = window_labels,
+                    })) {
+                        self.dsp_thread.worker.window_type.store(self.window_index, .release);
+                        self.dsp_thread.worker.window_dirty.store(1, .release);
+                    }
+
+                    if (zgui.sliderInt("Averages", .{ .min = 1, .max = 100, .v = &self.avg_count })) {
+                        self.dsp_thread.worker.avg_count.store(self.avg_count, .release);
+                        if (self.avg_count <= 1) {
+                            self.dsp_thread.worker.reset_requested.store(1, .release);
+                        }
+                    }
+
+                    if (zgui.checkbox("DC Filter", .{ .v = &self.dc_filter_enabled })) {
+                        self.dsp_thread.worker.dc_filter_enabled.store(@intFromBool(self.dc_filter_enabled), .release);
+                    }
+
+                    if (zgui.sliderInt("DSP Rate (Hz)", .{ .min = 1, .max = 500, .v = &self.dsp_rate })) {
+                        self.dsp_thread.setTargetRate(@intCast(self.dsp_rate));
+                    }
+
+                    _ = zgui.checkbox("Peak Hold", .{ .v = &self.peak_hold_enabled });
+                    self.dsp_thread.worker.peak_hold_enabled.store(@intFromBool(self.peak_hold_enabled), .release);
+
+                    zgui.sameLine(.{});
+                    if (zgui.button("Reset Peak", .{})) {
+                        self.dsp_thread.worker.reset_requested.store(1, .release);
+                    }
+                    if (zgui.sliderFloat("Peak Decay (dB/s)", .{ .min = 0, .max = 100, .v = &self.peak_decay_rate })) {
+                        self.dsp_thread.worker.peak_decay_rate.store(@bitCast(self.peak_decay_rate), .release);
+                    }
+
+                    zgui.separatorText("Waterfall");
+                    if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &self.waterfall.db_min })) {
+                        self.waterfall.rebuildLut();
+                        self.waterfall.dirty = true;
+                    }
+                    if (zgui.sliderFloat("dB Max", .{ .min = -160, .max = 0, .v = &self.waterfall.db_max })) {
+                        self.waterfall.rebuildLut();
+                        self.waterfall.dirty = true;
+                    }
                 }
-            }
 
-            if (zgui.checkbox("DC Filter", .{ .v = &self.dc_filter_enabled })) {
-                self.dsp_thread.worker.dc_filter_enabled.store(@intFromBool(self.dc_filter_enabled), .release);
-            }
-
-            if (zgui.sliderInt("DSP Rate (Hz)", .{ .min = 1, .max = 500, .v = &self.dsp_rate })) {
-                self.dsp_thread.setTargetRate(@intCast(self.dsp_rate));
-            }
-
-            _ = zgui.checkbox("Peak Hold", .{ .v = &self.peak_hold_enabled });
-            self.dsp_thread.worker.peak_hold_enabled.store(@intFromBool(self.peak_hold_enabled), .release);
-
-            zgui.sameLine(.{});
-            if (zgui.button("Reset Peak", .{})) {
-                self.dsp_thread.worker.reset_requested.store(1, .release);
-            }
-            if (zgui.sliderFloat("Peak Decay (dB/s)", .{ .min = 0, .max = 100, .v = &self.peak_decay_rate })) {
-                self.dsp_thread.worker.peak_decay_rate.store(@bitCast(self.peak_decay_rate), .release);
-            }
-
-            zgui.separatorText("Waterfall");
-            if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &self.waterfall.db_min })) {
-                self.waterfall.rebuildLut();
-                self.waterfall.dirty = true;
-            }
-            if (zgui.sliderFloat("dB Max", .{ .min = -160, .max = 0, .v = &self.waterfall.db_max })) {
-                self.waterfall.rebuildLut();
-                self.waterfall.dirty = true;
+                if (zgui.beginTabItem("Signal Info", .{})) {
+                    defer zgui.endTabItem();
+                    self.renderSignalInfo();
+                }
             }
         }
         zgui.end();
 
         return result;
+    }
+
+    fn renderSignalInfo(self: *const Self) void {
+        if (!self.has_frame) {
+            zgui.text("No data", .{});
+            return;
+        }
+
+        const s = self.stats;
+
+        zgui.separatorText("Overview");
+        zgui.text("Peak:        {d:.3} MHz  @ {d:.1} dB", .{ s.peak_freq_mhz, s.peak_power_db });
+        zgui.text("Noise Floor: {d:.1} dB", .{s.noise_floor_db});
+        zgui.text("SFDR:        {d:.1} dB", .{s.sfdr_db});
+        zgui.text("SNR:         {d:.1} dB", .{s.snr_db});
+
+        zgui.separatorText("Top Peaks");
+        if (s.num_peaks == 0) {
+            zgui.text("No peaks detected", .{});
+            return;
+        }
+
+        if (zgui.beginTable("peaks_table", .{
+            .column = 3,
+            .flags = .{ .borders = .{ .inner_h = true, .outer_h = true }, .row_bg = true, .sizing = .stretch_prop },
+        })) {
+            defer zgui.endTable();
+
+            zgui.tableSetupColumn("#", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 24 });
+            zgui.tableSetupColumn("Freq (MHz)", .{});
+            zgui.tableSetupColumn("Power (dB)", .{});
+            zgui.tableHeadersRow();
+
+            for (0..s.num_peaks) |i| {
+                zgui.tableNextRow(.{});
+                _ = zgui.tableNextColumn();
+                zgui.text("{d}", .{i + 1});
+                _ = zgui.tableNextColumn();
+                zgui.text("{d:.3}", .{s.peaks[i].freq_mhz});
+                _ = zgui.tableNextColumn();
+                zgui.text("{d:.1}", .{s.peaks[i].power_db});
+            }
+        }
     }
 
     fn computeFreqs(freqs: []f32, fft_size: u32, cf_mhz: f32, fs_hz: f64) void {

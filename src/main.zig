@@ -6,6 +6,7 @@ const SimpleFFT = @import("simple_fft.zig").SimpleFFT;
 const WindowType = @import("simple_fft.zig").WindowType;
 const Waterfall = @import("waterfall.zig").Waterfall;
 const util = @import("util.zig");
+const HackRFConfig = @import("hackrf_config.zig").HackRFConfig;
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -40,11 +41,6 @@ const SDR = struct {
     const Self = @This();
 
     device: hackrf.Device = undefined,
-    connected: bool = false,
-    version_str: [256]u8 = std.mem.zeroes([256]u8),
-
-    fs: f64 = util.mhz(20),
-    cf: u64 = util.ghz(0.9),
 
     mutex: std.Thread.Mutex = .{},
 
@@ -53,10 +49,8 @@ const SDR = struct {
 
     rx_buffer: FixedSizeRingBuffer([2]f32) = undefined,
 
-    pub fn init(alloc: std.mem.Allocator, cf: u64, fs: f64) !Self {
+    pub fn init(alloc: std.mem.Allocator) !Self {
         var self = Self{};
-        self.cf = cf;
-        self.fs = fs;
         try hackrf.init();
 
         var list = try hackrf.DeviceList.get();
@@ -65,12 +59,7 @@ const SDR = struct {
         if (list.count() == 0) return error.NoDeviceFound;
 
         self.device = try hackrf.Device.open();
-        _ = try self.device.versionStringRead(&self.version_str);
-
         self.device.stopTx() catch {};
-        try self.device.setSampleRate(self.fs);
-        try self.device.setFreq(self.cf);
-        try self.device.setAmpEnable(true);
 
         self.rx_buffer = try FixedSizeRingBuffer([2]f32).init(alloc, util.mb(64));
 
@@ -257,27 +246,24 @@ pub fn main() !void {
     defer zgui.backend.deinit();
 
     //
-    // FFT setup
+    // HackRF config
     //
 
-    const default_cf = util.ghz(2.4);
-    const default_fs = util.mhz(20);
+    var config: HackRFConfig = .{};
 
-    const sample_rate_values = [_]f64{ util.mhz(2), util.mhz(4), util.mhz(8), util.mhz(10), util.mhz(16), util.mhz(20) };
-    const sample_rate_labels: [:0]const u8 = "2 MHz\x004 MHz\x008 MHz\x0010 MHz\x0016 MHz\x0020 MHz\x00";
+    //
+    // FFT setup
+    //
 
     const fft_size_values = [_]u32{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
     const fft_size_labels: [:0]const u8 = "64\x00128\x00256\x00512\x001024\x002048\x004096\x008192\x00";
 
-    var cf_slider: f32 = @as(f32, @floatFromInt(@as(u32, @intCast(default_cf)))) / util.mhz(1);
-    var fs_index: i32 = 5;
-    var fft_size_index: i32 = 6;
-
+    var fft_size_index: i32 = 7;
     const default_fft_size = fft_size_values[@intCast(fft_size_index)];
 
     var refit_x = true;
 
-    var fft = try SimpleFFT.init(alloc, default_fft_size, default_cf, default_fs, .NONE);
+    var fft = try SimpleFFT.init(alloc, default_fft_size, config.cf_mhz * 1e6, @floatCast(config.fsHz()), .NONE);
     defer fft.deinit(alloc);
 
     var fft_buf: [][2]f32 = try alloc.alloc([2]f32, default_fft_size);
@@ -299,16 +285,9 @@ pub fn main() !void {
     createWaterfallTexture(gpu_device, default_fft_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
     defer destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
 
-    var fft_target_fps: i32 = 30;
-    var fft_frame_interval_us: u64 = 1_000_000 / @as(u64, @intCast(fft_target_fps));
+    const fft_target_fps: i32 = 30;
+    const fft_frame_interval_us: u64 = 1_000_000 / @as(u64, @intCast(fft_target_fps));
     var last_fft_time_us: u64 = zsdl.getTicks() * 1000;
-
-    //
-    // RF Gain state
-    //
-    var lna_gain: i32 = 0; // 0-40, 8dB steps
-    var vga_gain: i32 = 0; // 0-62, 2dB steps
-    var amp_enable: bool = true;
 
     //
     // CF follow / rate-limit state
@@ -336,9 +315,6 @@ pub fn main() !void {
 
     // Window function state
     var window_index: i32 = 3; // BLACKMAN_HARRIS
-
-    var sdr_connect_err: bool = false;
-    var sdr_connect_err_msg: []const u8 = undefined;
 
     //
     // Main loop
@@ -458,148 +434,106 @@ pub fn main() !void {
             zgui.backend.newFrame(sw_w, sw_h, fb_scale);
 
             {
-                zgui.setNextWindowPos(.{ .x = 174, .y = 109, .cond = .first_use_ever });
-                zgui.setNextWindowSize(.{ .w = 509, .h = 500, .cond = .first_use_ever });
+                config.render(if (sdr != null) sdr.?.device else null);
 
-                if (zgui.begin(zgui.formatZ("Config ({d:.0} fps)###Config", .{zgui.io.getFramerate()}), .{
-                    .flags = .{},
-                })) {
+                if (config.connect_requested) {
+                    config.connect_requested = false;
+                    config.connect_error_msg = null;
+
+                    sdr = SDR.init(alloc) catch |err| blk: {
+                        config.connect_error_msg = lookupErrMsg(err);
+                        break :blk null;
+                    };
+
                     if (sdr != null) {
-                        if (zgui.button("Disconnect", .{})) {
-                            sdr.?.rx_running = false;
-                            try sdr.?.deinit(alloc);
-                            sdr = null;
+                        config.readDeviceInfo(sdr.?.device);
+                        config.applyAll(sdr.?.device);
+                        fft.updateFreqs(config.cf_mhz * 1e6, @floatCast(config.fsHz()));
+                        refit_x = true;
+                        try sdr.?.startRx();
+                    }
+                }
 
-                            @memset(fft.fft_mag, 0);
-                            waterfall.clear();
-                        } else {
-                            zgui.text("hackrf firmware verison {s}", .{sdr.?.version_str});
+                if (config.disconnect_requested) {
+                    config.disconnect_requested = false;
+                    sdr.?.rx_running = false;
+                    try sdr.?.deinit(alloc);
+                    sdr = null;
+                    config.clearDeviceInfo();
+                    config.connect_error_msg = null;
+                    @memset(fft.fft_mag, 0);
+                    waterfall.clear();
+                }
 
-                            if (zgui.sliderFloat("Center Freq (MHz)", .{ .min = 0, .max = 6000, .v = &cf_slider })) {
-                                const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
-                                try sdr.?.device.setFreq(cf_hz);
-                                fft.updateFreqs(cf_slider * 1e6, @floatCast(sample_rate_values[@intCast(fs_index)]));
-                                refit_x = true;
-                                ema_initialized = false;
-                            }
+                if (config.freq_changed) {
+                    config.freq_changed = false;
+                    fft.updateFreqs(config.cf_mhz * 1e6, @floatCast(config.fsHz()));
+                    refit_x = true;
+                    ema_initialized = false;
+                }
 
-                            if (zgui.combo("Sample Rate", .{
-                                .current_item = &fs_index,
-                                .items_separated_by_zeros = sample_rate_labels,
-                            })) {
-                                const new_fs = sample_rate_values[@intCast(fs_index)];
-                                try sdr.?.device.setSampleRate(new_fs);
-                                fft.updateFreqs(cf_slider * 1e6, @floatCast(new_fs));
-                                refit_x = true;
-                            }
+                if (config.sample_rate_changed) {
+                    config.sample_rate_changed = false;
+                    fft.updateFreqs(config.cf_mhz * 1e6, @floatCast(config.fsHz()));
+                    refit_x = true;
+                }
 
-                            if (zgui.combo("FFT Size", .{
-                                .current_item = &fft_size_index,
-                                .items_separated_by_zeros = fft_size_labels,
-                            })) {
-                                const new_size = fft_size_values[@intCast(fft_size_index)];
-                                const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
-                                fft.deinit(alloc);
-                                fft = try SimpleFFT.init(alloc, new_size, cf_slider * 1e6, @floatCast(fs_hz), @enumFromInt(window_index));
+                zgui.setNextWindowPos(.{ .x = 360, .y = 10, .cond = .first_use_ever });
+                zgui.setNextWindowSize(.{ .w = 340, .h = 400, .cond = .first_use_ever });
 
-                                fft_buf = try alloc.realloc(fft_buf, new_size);
+                if (zgui.begin(zgui.formatZ("Analysis ({d:.0} fps)###Analysis", .{zgui.io.getFramerate()}), .{})) {
+                    if (zgui.combo("FFT Size", .{
+                        .current_item = &fft_size_index,
+                        .items_separated_by_zeros = fft_size_labels,
+                    })) {
+                        const new_size = fft_size_values[@intCast(fft_size_index)];
+                        fft.deinit(alloc);
+                        fft = try SimpleFFT.init(alloc, new_size, config.cf_mhz * 1e6, @floatCast(config.fsHz()), @enumFromInt(window_index));
 
-                                // Recreate waterfall for new FFT size
-                                waterfall.deinit(alloc);
-                                waterfall = try Waterfall.init(alloc, new_size, 256);
-                                destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
-                                createWaterfallTexture(gpu_device, new_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
+                        fft_buf = try alloc.realloc(fft_buf, new_size);
 
-                                // Realloc peak hold and EMA buffers
-                                peak_hold_data = try alloc.realloc(peak_hold_data, new_size);
-                                @memset(peak_hold_data, -200.0);
+                        waterfall.deinit(alloc);
+                        waterfall = try Waterfall.init(alloc, new_size, 256);
+                        destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
+                        createWaterfallTexture(gpu_device, new_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
 
-                                ema_data = try alloc.realloc(ema_data, new_size);
-                                @memset(ema_data, -200.0);
-                                ema_initialized = false;
-                            }
+                        peak_hold_data = try alloc.realloc(peak_hold_data, new_size);
+                        @memset(peak_hold_data, -200.0);
 
-                            if (zgui.sliderInt("FFT Rate (fps)", .{ .min = 1, .max = 120, .v = &fft_target_fps })) {
-                                fft_frame_interval_us = 1_000_000 / @as(u64, @intCast(@max(fft_target_fps, 1)));
-                            }
+                        ema_data = try alloc.realloc(ema_data, new_size);
+                        @memset(ema_data, -200.0);
+                        ema_initialized = false;
+                    }
 
-                            // --- RF Gain ---
-                            zgui.separatorText("RF Gain");
+                    if (zgui.combo("Window", .{
+                        .current_item = &window_index,
+                        .items_separated_by_zeros = @import("simple_fft.zig").window_labels,
+                    })) {
+                        fft.setWindow(@enumFromInt(window_index));
+                    }
 
-                            if (zgui.sliderInt("LNA (dB)", .{ .min = 0, .max = 40, .v = &lna_gain })) {
-                                // Snap to 8dB steps
-                                lna_gain = @divTrunc(lna_gain + 4, 8) * 8;
-                                lna_gain = std.math.clamp(lna_gain, 0, 40);
-                                sdr.?.device.setLnaGain(@intCast(lna_gain)) catch {};
-                            }
-
-                            if (zgui.sliderInt("VGA (dB)", .{ .min = 0, .max = 62, .v = &vga_gain })) {
-                                // Snap to 2dB steps
-                                vga_gain = @divTrunc(vga_gain + 1, 2) * 2;
-                                vga_gain = std.math.clamp(vga_gain, 0, 62);
-                                sdr.?.device.setVgaGain(@intCast(vga_gain)) catch {};
-                            }
-
-                            if (zgui.checkbox("RF Amp (+14 dB)", .{ .v = &amp_enable })) {
-                                sdr.?.device.setAmpEnable(amp_enable) catch {};
-                            }
-
-                            // --- DSP ---
-                            zgui.separatorText("DSP");
-
-                            if (zgui.combo("Window", .{
-                                .current_item = &window_index,
-                                .items_separated_by_zeros = @import("simple_fft.zig").window_labels,
-                            })) {
-                                fft.setWindow(@enumFromInt(window_index));
-                            }
-
-                            if (zgui.sliderInt("Averages", .{ .min = 1, .max = 100, .v = &avg_count })) {
-                                if (avg_count <= 1) {
-                                    ema_initialized = false;
-                                }
-                            }
-
-                            _ = zgui.checkbox("Peak Hold", .{ .v = &peak_hold_enabled });
-                            zgui.sameLine(.{});
-                            if (zgui.button("Reset Peak", .{})) {
-                                @memset(peak_hold_data, -200.0);
-                                last_peak_time_ms = 0;
-                            }
-                            _ = zgui.sliderFloat("Peak Decay (dB/s)", .{ .min = 0, .max = 100, .v = &peak_decay_rate });
-
-                            // --- Waterfall ---
-                            zgui.separatorText("Waterfall");
-                            if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &waterfall.db_min })) {
-                                waterfall.rebuildLut();
-                                waterfall.dirty = true;
-                            }
-                            if (zgui.sliderFloat("dB Max", .{ .min = -160, .max = 0, .v = &waterfall.db_max })) {
-                                waterfall.rebuildLut();
-                                waterfall.dirty = true;
-                            }
+                    if (zgui.sliderInt("Averages", .{ .min = 1, .max = 100, .v = &avg_count })) {
+                        if (avg_count <= 1) {
+                            ema_initialized = false;
                         }
-                    } else {
-                        if (zgui.button("Connect", .{})) {
-                            const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
-                            const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
+                    }
 
-                            sdr = SDR.init(alloc, cf_hz, fs_hz) catch |err| blk: {
-                                sdr_connect_err = true;
-                                sdr_connect_err_msg = lookupErrMsg(err);
-                                break :blk null;
-                            };
+                    _ = zgui.checkbox("Peak Hold", .{ .v = &peak_hold_enabled });
+                    zgui.sameLine(.{});
+                    if (zgui.button("Reset Peak", .{})) {
+                        @memset(peak_hold_data, -200.0);
+                        last_peak_time_ms = 0;
+                    }
+                    _ = zgui.sliderFloat("Peak Decay (dB/s)", .{ .min = 0, .max = 100, .v = &peak_decay_rate });
 
-                            if (!sdr_connect_err) {
-                                try sdr.?.startRx();
-                                sdr_connect_err = false;
-                                fft.updateFreqs(cf_slider * 1e6, @floatCast(fs_hz));
-                            }
-                        }
-
-                        if (sdr_connect_err) {
-                            zgui.textColored(.{ 0.9, 0.1, 0.1, 1 }, "Connection Error: {s}", .{sdr_connect_err_msg});
-                        }
+                    zgui.separatorText("Waterfall");
+                    if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &waterfall.db_min })) {
+                        waterfall.rebuildLut();
+                        waterfall.dirty = true;
+                    }
+                    if (zgui.sliderFloat("dB Max", .{ .min = -160, .max = 0, .v = &waterfall.db_max })) {
+                        waterfall.rebuildLut();
+                        waterfall.dirty = true;
                     }
                 }
                 zgui.end();
@@ -664,7 +598,7 @@ pub fn main() !void {
                     // CF follow: rate-limited retune on horizontal pan (max 10 Hz)
                     if (sdr != null and plot_result.hovered) {
                         const plot_center = (plot_result.limits.x_min + plot_result.limits.x_max) / 2.0;
-                        const cf_mhz: f64 = @floatCast(cf_slider);
+                        const cf_mhz: f64 = @floatCast(config.cf_mhz);
                         const diff = @abs(plot_center - cf_mhz);
 
                         if (diff > 0.1) {
@@ -674,8 +608,8 @@ pub fn main() !void {
                                 const new_cf_hz: u64 = @intFromFloat(@max(0.0, plot_center * 1e6));
                                 if (new_cf_hz > 0) {
                                     sdr.?.device.setFreq(new_cf_hz) catch {};
-                                    cf_slider = @floatCast(plot_center);
-                                    fft.updateFreqs(@floatCast(plot_center * 1e6), @floatCast(sample_rate_values[@intCast(fs_index)]));
+                                    config.cf_mhz = @floatCast(plot_center);
+                                    fft.updateFreqs(@floatCast(plot_center * 1e6), @floatCast(config.fsHz()));
                                     ema_initialized = false;
                                     refit_x = true;
                                 }

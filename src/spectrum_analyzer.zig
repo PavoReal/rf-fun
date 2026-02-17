@@ -1,4 +1,5 @@
 const std = @import("std");
+const hackrf = @import("rf_fun");
 const SimpleFFT = @import("simple_fft.zig").SimpleFFT;
 const WindowType = @import("simple_fft.zig").WindowType;
 const window_labels = @import("simple_fft.zig").window_labels;
@@ -22,6 +23,7 @@ pub const SpectrumAnalyzer = struct {
 
     fft: SimpleFFT,
     fft_buf: [][2]f32,
+    iq_scratch: []hackrf.IQSample,
 
     fft_size_index: i32,
     window_index: i32,
@@ -59,6 +61,9 @@ pub const SpectrumAnalyzer = struct {
         const fft_buf = try alloc.alloc([2]f32, fft_size);
         errdefer alloc.free(fft_buf);
 
+        const iq_scratch = try alloc.alloc(hackrf.IQSample, fft_size);
+        errdefer alloc.free(iq_scratch);
+
         const ema_data = try alloc.alloc(f32, fft_size);
         errdefer alloc.free(ema_data);
         @memset(ema_data, -200.0);
@@ -76,6 +81,7 @@ pub const SpectrumAnalyzer = struct {
             .alloc = alloc,
             .fft = fft,
             .fft_buf = fft_buf,
+            .iq_scratch = iq_scratch,
             .fft_size_index = fft_size_index,
             .window_index = window_index,
             .avg_count = 2,
@@ -96,6 +102,7 @@ pub const SpectrumAnalyzer = struct {
     pub fn deinit(self: *Self) void {
         self.fft.deinit(self.alloc);
         self.alloc.free(self.fft_buf);
+        self.alloc.free(self.iq_scratch);
         self.alloc.free(self.ema_data);
         self.alloc.free(self.peak_hold_data);
         self.waterfall.deinit(self.alloc);
@@ -109,6 +116,7 @@ pub const SpectrumAnalyzer = struct {
         self.fft = try SimpleFFT.init(self.alloc, new_size, cf_mhz * 1e6, @floatCast(fs_hz), @enumFromInt(self.window_index));
 
         self.fft_buf = try self.alloc.realloc(self.fft_buf, new_size);
+        self.iq_scratch = try self.alloc.realloc(self.iq_scratch, new_size);
 
         self.waterfall.deinit(self.alloc);
         self.waterfall = try Waterfall.init(self.alloc, new_size, self.wf_history_len);
@@ -141,17 +149,21 @@ pub const SpectrumAnalyzer = struct {
         self.waterfall.clear();
     }
 
-    pub fn processFrame(self: *Self, mutex: *std.Thread.Mutex, rx_buffer: *FixedSizeRingBuffer([2]f32)) bool {
+    pub fn processFrame(self: *Self, mutex: *std.Thread.Mutex, rx_buffer: *FixedSizeRingBuffer(hackrf.IQSample)) bool {
         const current_time_us = zsdl.getTicks() * 1000;
         if (current_time_us - self.last_fft_time_us < self.fft_frame_interval_us) return false;
         if (!mutex.tryLock()) return false;
 
         self.last_fft_time_us = current_time_us;
-        const fft_slice = self.fft_buf[0..self.fft.fft_size];
-        const copied = rx_buffer.copyNewest(fft_slice);
+        const copied = rx_buffer.copyNewest(self.iq_scratch[0..self.fft.fft_size]);
         mutex.unlock();
 
         if (copied != self.fft.fft_size) return false;
+
+        const fft_slice = self.fft_buf[0..self.fft.fft_size];
+        for (self.iq_scratch[0..copied], fft_slice) |sample, *out| {
+            out.* = sample.toFloat();
+        }
 
         self.fft.calc(fft_slice);
 

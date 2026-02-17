@@ -23,14 +23,8 @@ fn sdrRxCallback(trans: hackrf.Transfer, state: *SDR) hackrf.StreamAction {
     state.mutex.lock();
     defer state.mutex.unlock();
 
-    const valid_length = trans.validLength();
-    state.rx_bytes_received += valid_length;
-
-    const raw_samples = trans.iqSamples();
-
-    for (raw_samples) |sample| {
-        state.rx_buffer.appendOne(sample.toFloat());
-    }
+    state.rx_bytes_received += trans.validLength();
+    state.rx_buffer.append(trans.iqSamples());
 
     if (!state.rx_running) return .stop;
     return .@"continue";
@@ -46,7 +40,7 @@ const SDR = struct {
     rx_running: bool = false,
     rx_bytes_received: u64 = 0,
 
-    rx_buffer: FixedSizeRingBuffer([2]f32) = undefined,
+    rx_buffer: FixedSizeRingBuffer(hackrf.IQSample) = undefined,
 
     pub fn init(alloc: std.mem.Allocator) !Self {
         var self = Self{};
@@ -60,7 +54,7 @@ const SDR = struct {
         self.device = try hackrf.Device.open();
         self.device.stopTx() catch {};
 
-        self.rx_buffer = try FixedSizeRingBuffer([2]f32).init(alloc, util.mb(64));
+        self.rx_buffer = try FixedSizeRingBuffer(hackrf.IQSample).init(alloc, util.mb(64));
 
         return self;
     }
@@ -251,6 +245,7 @@ pub fn main() !void {
 
     var config: HackRFConfig = .{};
     config.connect_requested = true;
+    config.amp_enable = true;
 
     var analyzer = try SpectrumAnalyzer.init(alloc, 7, 3, config.cf_mhz, config.fsHz(), 256);
     defer analyzer.deinit();

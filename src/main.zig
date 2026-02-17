@@ -201,6 +201,26 @@ const WaterfallGpu = struct {
     }
 };
 
+fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
+    _ = zgui.dockBuilderAddNode(dockspace_id, .{ .dock_space = true });
+    const vp = zgui.getMainViewport();
+    const vp_size = vp.getSize();
+    zgui.dockBuilderSetNodeSize(dockspace_id, vp_size);
+
+    var right_id: zgui.Ident = undefined;
+    var left_id: zgui.Ident = undefined;
+    _ = zgui.dockBuilderSplitNode(dockspace_id, .left, 0.30, &left_id, &right_id);
+
+    var top_id: zgui.Ident = undefined;
+    var bottom_id: zgui.Ident = undefined;
+    _ = zgui.dockBuilderSplitNode(right_id, .up, 0.25, &top_id, &bottom_id);
+
+    zgui.dockBuilderDockWindow("HackRF Config", left_id);
+    zgui.dockBuilderDockWindow("###Analysis", top_id);
+    zgui.dockBuilderDockWindow("Data View", bottom_id);
+    zgui.dockBuilderFinish(dockspace_id);
+}
+
 pub fn main() !void {
     var allocator: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(allocator.deinit() == .ok);
@@ -231,6 +251,8 @@ pub fn main() !void {
     zgui.init(alloc);
     defer zgui.deinit();
 
+    zgui.io.setConfigFlags(.{.dock_enable = true});
+
     zgui.plot.init();
     defer zgui.plot.deinit();
 
@@ -254,6 +276,7 @@ pub fn main() !void {
     defer wf_gpu.deinit();
 
     var last_retune_time_ms: u64 = 0;
+    var dock_initialized = false;
 
     var running = true;
     while (running) {
@@ -268,7 +291,7 @@ pub fn main() !void {
         }
 
         if (sdr != null) {
-            _ = analyzer.processFrame(&sdr.?.mutex, &sdr.?.rx_buffer);
+            _ = analyzer.pollFrame();
         }
 
         if (analyzer.waterfall.dirty) {
@@ -300,6 +323,21 @@ pub fn main() !void {
 
             zgui.backend.newFrame(sw_w, sw_h, fb_scale);
 
+            const dockspace_id: zgui.Ident = 0xB00B1E5;
+            if (!dock_initialized) {
+                dock_initialized = true;
+                if (zgui.dockBuilderGetNode(dockspace_id) == null) {
+                    buildDefaultDockLayout(dockspace_id);
+                }
+            }
+            _ = zgui.dockSpaceOverViewport(dockspace_id, zgui.getMainViewport(), .{ .passthru_central_node = true });
+
+            if (config.reset_layout_requested) {
+                config.reset_layout_requested = false;
+                zgui.dockBuilderRemoveNode(dockspace_id);
+                buildDefaultDockLayout(dockspace_id);
+            }
+
             {
                 config.render(if (sdr != null) sdr.?.device else null);
 
@@ -317,11 +355,13 @@ pub fn main() !void {
                         config.applyAll(sdr.?.device);
                         analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                         try sdr.?.startRx();
+                        try analyzer.startThread(&sdr.?.mutex, &sdr.?.rx_buffer);
                     }
                 }
 
                 if (config.disconnect_requested) {
                     config.disconnect_requested = false;
+                    analyzer.stopThread();
                     sdr.?.rx_running = false;
                     try sdr.?.deinit(alloc);
                     sdr = null;
@@ -344,10 +384,10 @@ pub fn main() !void {
                 const ui_result = try analyzer.renderUi(zgui.io.getFramerate(), config.cf_mhz, config.fsHz());
                 if (ui_result.resized) {
                     wf_gpu.resize(ui_result.new_fft_size, 256);
+                    if (sdr != null) {
+                        try analyzer.startThread(&sdr.?.mutex, &sdr.?.rx_buffer);
+                    }
                 }
-
-                zgui.setNextWindowPos(.{ .x = 683, .y = 109, .cond = .first_use_ever });
-                zgui.setNextWindowSize(.{ .w = 1149, .h = 810, .cond = .first_use_ever });
 
                 if (zgui.begin("Data View", .{})) {
                     const avail = zgui.getContentRegionAvail();
@@ -371,7 +411,7 @@ pub fn main() !void {
                         series_buf[series_count] = .{
                             .label = "Peak Hold",
                             .x_data = freq_data,
-                            .y_data = analyzer.peak_hold_data[0..analyzer.fftSize()],
+                            .y_data = analyzer.cached_peak[0..analyzer.fftSize()],
                             .color = .{ 1.0, 0.2, 0.2, 0.8 },
                             .line_weight = 1.0,
                         };
@@ -456,6 +496,7 @@ pub fn main() !void {
     }
 
     if (sdr != null) {
+        analyzer.stopThread();
         sdr.?.rx_running = false;
         try sdr.?.deinit(alloc);
     }

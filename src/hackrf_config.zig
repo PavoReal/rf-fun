@@ -46,6 +46,9 @@ pub const HackRFConfig = struct {
     disconnect_requested: bool = false,
     connect_error_msg: ?[]const u8 = null,
 
+    reset_layout_requested: bool = false,
+    theme_index: i32 = 0,
+
     pub fn cfHz(self: *const HackRFConfig) u64 {
         return @intFromFloat(self.cf_mhz * 1e6);
     }
@@ -120,6 +123,20 @@ pub const HackRFConfig = struct {
         }
         defer zgui.end();
 
+        if (zgui.beginTabBar("ConfigTabs", .{})) {
+            if (zgui.beginTabItem("HackRF", .{})) {
+                self.renderHackRFTab(device);
+                zgui.endTabItem();
+            }
+            if (zgui.beginTabItem("GUI", .{})) {
+                self.renderGuiTab();
+                zgui.endTabItem();
+            }
+            zgui.endTabBar();
+        }
+    }
+
+    fn renderHackRFTab(self: *HackRFConfig, device: ?hackrf.Device) void {
         if (device != null) {
             if (zgui.button("Disconnect", .{})) {
                 self.disconnect_requested = true;
@@ -269,5 +286,41 @@ pub const HackRFConfig = struct {
         }
 
         if (disabled) zgui.endDisabled();
+    }
+
+    const theme_labels: [:0]const u8 = "Dark\x00Light\x00Classic\x00";
+
+    fn renderGuiTab(self: *HackRFConfig) void {
+        zgui.separatorText("Theme");
+
+        if (zgui.combo("Theme", .{
+            .current_item = &self.theme_index,
+            .items_separated_by_zeros = theme_labels,
+        })) {
+            const style = zgui.getStyle();
+            switch (self.theme_index) {
+                0 => style.setColorsBuiltin(.dark),
+                1 => style.setColorsBuiltin(.light),
+                2 => style.setColorsBuiltin(.classic),
+                else => {},
+            }
+        }
+
+        zgui.separatorText("Font");
+
+        const style = zgui.getStyle();
+        if (zgui.sliderFloat("Font Size", .{
+            .v = &style.font_size_base,
+            .min = 8.0,
+            .max = 32.0,
+        })) {
+            style._next_frame_font_size_base = style.font_size_base;
+        }
+
+        zgui.separatorText("Layout");
+
+        if (zgui.button("Reset Layout", .{})) {
+            self.reset_layout_requested = true;
+        }
     }
 };

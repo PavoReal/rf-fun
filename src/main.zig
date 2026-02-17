@@ -2,11 +2,10 @@ const std = @import("std");
 const hackrf = @import("rf_fun");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const plot = @import("plot.zig");
-const SimpleFFT = @import("simple_fft.zig").SimpleFFT;
-const WindowType = @import("simple_fft.zig").WindowType;
 const Waterfall = @import("waterfall.zig").Waterfall;
 const util = @import("util.zig");
 const HackRFConfig = @import("hackrf_config.zig").HackRFConfig;
+const SpectrumAnalyzer = @import("spectrum_analyzer.zig").SpectrumAnalyzer;
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -79,121 +78,134 @@ const SDR = struct {
     }
 };
 
-fn createWaterfallTexture(
-    device: *c.SDL_GPUDevice,
-    width: u32,
-    height: u32,
-    out_tex: *?*c.SDL_GPUTexture,
-    out_sampler: *?*c.SDL_GPUSampler,
-    out_transfer: *?*c.SDL_GPUTransferBuffer,
-    out_w: *u32,
-    out_h: *u32,
-    out_binding: *c.SDL_GPUTextureSamplerBinding,
-) void {
-    const tex_info = c.SDL_GPUTextureCreateInfo{
-        .type = c.SDL_GPU_TEXTURETYPE_2D,
-        .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-        .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
-        .width = width,
-        .height = height,
-        .layer_count_or_depth = 1,
-        .num_levels = 1,
-        .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
-        .props = 0,
-    };
-    out_tex.* = c.SDL_CreateGPUTexture(device, &tex_info);
+const WaterfallGpu = struct {
+    const Self = @This();
 
-    const sampler_info = c.SDL_GPUSamplerCreateInfo{
-        .min_filter = c.SDL_GPU_FILTER_NEAREST,
-        .mag_filter = c.SDL_GPU_FILTER_NEAREST,
-        .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
-        .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-        .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-        .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-        .mip_lod_bias = 0,
-        .max_anisotropy = 1,
-        .compare_op = 0,
-        .min_lod = 0,
-        .max_lod = 0,
-        .enable_anisotropy = false,
-        .enable_compare = false,
-        .padding1 = 0,
-        .padding2 = 0,
-        .props = 0,
-    };
-    out_sampler.* = c.SDL_CreateGPUSampler(device, &sampler_info);
-
-    const transfer_info = c.SDL_GPUTransferBufferCreateInfo{
-        .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-        .size = width * height * 4,
-        .props = 0,
-    };
-    out_transfer.* = c.SDL_CreateGPUTransferBuffer(device, &transfer_info);
-
-    out_w.* = width;
-    out_h.* = height;
-    out_binding.texture = out_tex.*;
-    out_binding.sampler = out_sampler.*;
-}
-
-fn destroyWaterfallTexture(
-    device: *c.SDL_GPUDevice,
-    tex: *?*c.SDL_GPUTexture,
-    sampler: *?*c.SDL_GPUSampler,
-    transfer: *?*c.SDL_GPUTransferBuffer,
-) void {
-    if (tex.*) |t| c.SDL_ReleaseGPUTexture(device, t);
-    if (sampler.*) |s| c.SDL_ReleaseGPUSampler(device, s);
-    if (transfer.*) |tb| c.SDL_ReleaseGPUTransferBuffer(device, tb);
-    tex.* = null;
-    sampler.* = null;
-    transfer.* = null;
-}
-
-fn uploadWaterfallTexture(
-    device: *c.SDL_GPUDevice,
-    waterfall: *Waterfall,
-    tex: ?*c.SDL_GPUTexture,
+    gpu_device: *c.SDL_GPUDevice,
+    texture: ?*c.SDL_GPUTexture,
+    sampler: ?*c.SDL_GPUSampler,
     transfer_buf: ?*c.SDL_GPUTransferBuffer,
     tex_w: u32,
     tex_h: u32,
-) void {
-    const tb = transfer_buf orelse return;
-    const texture = tex orelse return;
+    binding: c.SDL_GPUTextureSamplerBinding,
 
-    const mapped: ?[*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(device, tb, false));
-    if (mapped) |ptr| {
-        const byte_count = tex_w * tex_h * 4;
-        @memcpy(ptr[0..byte_count], waterfall.pixels[0..byte_count]);
-        c.SDL_UnmapGPUTransferBuffer(device, tb);
+    fn init(gpu_device: *c.SDL_GPUDevice, width: u32, height: u32) Self {
+        var self = Self{
+            .gpu_device = gpu_device,
+            .texture = null,
+            .sampler = null,
+            .transfer_buf = null,
+            .tex_w = 0,
+            .tex_h = 0,
+            .binding = .{ .texture = null, .sampler = null },
+        };
+        self.create(width, height);
+        return self;
     }
 
-    const cmd_buf = c.SDL_AcquireGPUCommandBuffer(device) orelse return;
-    const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buf) orelse return;
+    fn deinit(self: *Self) void {
+        self.destroy();
+    }
 
-    const src = c.SDL_GPUTextureTransferInfo{
-        .transfer_buffer = tb,
-        .offset = 0,
-        .pixels_per_row = tex_w,
-        .rows_per_layer = tex_h,
-    };
+    fn resize(self: *Self, width: u32, height: u32) void {
+        self.destroy();
+        self.create(width, height);
+    }
 
-    const dst = c.SDL_GPUTextureRegion{
-        .texture = texture,
-        .mip_level = 0,
-        .layer = 0,
-        .x = 0,
-        .y = 0,
-        .z = 0,
-        .w = tex_w,
-        .h = tex_h,
-        .d = 1,
-    };
+    fn upload(self: *Self, waterfall: *Waterfall) void {
+        const tb = self.transfer_buf orelse return;
+        const texture = self.texture orelse return;
 
-    c.SDL_UploadToGPUTexture(copy_pass, &src, &dst, false);
-    c.SDL_EndGPUCopyPass(copy_pass);
-    _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
-}
+        const mapped: ?[*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(self.gpu_device, tb, false));
+        if (mapped) |ptr| {
+            const byte_count = self.tex_w * self.tex_h * 4;
+            @memcpy(ptr[0..byte_count], waterfall.pixels[0..byte_count]);
+            c.SDL_UnmapGPUTransferBuffer(self.gpu_device, tb);
+        }
+
+        const cmd_buf = c.SDL_AcquireGPUCommandBuffer(self.gpu_device) orelse return;
+        const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buf) orelse return;
+
+        const src = c.SDL_GPUTextureTransferInfo{
+            .transfer_buffer = tb,
+            .offset = 0,
+            .pixels_per_row = self.tex_w,
+            .rows_per_layer = self.tex_h,
+        };
+
+        const dst = c.SDL_GPUTextureRegion{
+            .texture = texture,
+            .mip_level = 0,
+            .layer = 0,
+            .x = 0,
+            .y = 0,
+            .z = 0,
+            .w = self.tex_w,
+            .h = self.tex_h,
+            .d = 1,
+        };
+
+        c.SDL_UploadToGPUTexture(copy_pass, &src, &dst, false);
+        c.SDL_EndGPUCopyPass(copy_pass);
+        _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
+    }
+
+    fn create(self: *Self, width: u32, height: u32) void {
+        const tex_info = c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = width,
+            .height = height,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        };
+        self.texture = c.SDL_CreateGPUTexture(self.gpu_device, &tex_info);
+
+        const sampler_info = c.SDL_GPUSamplerCreateInfo{
+            .min_filter = c.SDL_GPU_FILTER_NEAREST,
+            .mag_filter = c.SDL_GPU_FILTER_NEAREST,
+            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+            .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .mip_lod_bias = 0,
+            .max_anisotropy = 1,
+            .compare_op = 0,
+            .min_lod = 0,
+            .max_lod = 0,
+            .enable_anisotropy = false,
+            .enable_compare = false,
+            .padding1 = 0,
+            .padding2 = 0,
+            .props = 0,
+        };
+        self.sampler = c.SDL_CreateGPUSampler(self.gpu_device, &sampler_info);
+
+        const transfer_info = c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = width * height * 4,
+            .props = 0,
+        };
+        self.transfer_buf = c.SDL_CreateGPUTransferBuffer(self.gpu_device, &transfer_info);
+
+        self.tex_w = width;
+        self.tex_h = height;
+        self.binding.texture = self.texture;
+        self.binding.sampler = self.sampler;
+    }
+
+    fn destroy(self: *Self) void {
+        if (self.texture) |t| c.SDL_ReleaseGPUTexture(self.gpu_device, t);
+        if (self.sampler) |s| c.SDL_ReleaseGPUSampler(self.gpu_device, s);
+        if (self.transfer_buf) |tb| c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, tb);
+        self.texture = null;
+        self.sampler = null;
+        self.transfer_buf = null;
+    }
+};
 
 pub fn main() !void {
     var allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -202,10 +214,6 @@ pub fn main() !void {
     const alloc = allocator.allocator();
 
     var sdr: ?SDR = null;
-
-    //
-    // SDL3 + GPU init
-    //
 
     try zsdl.init(.{ .video = true, .events = true });
     defer zsdl.quit();
@@ -226,10 +234,6 @@ pub fn main() !void {
 
     const swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(gpu_device, @ptrCast(window));
 
-    //
-    // zgui + ImPlot init
-    //
-
     zgui.init(alloc);
     defer zgui.deinit();
 
@@ -245,88 +249,20 @@ pub fn main() !void {
     });
     defer zgui.backend.deinit();
 
-    //
-    // HackRF config
-    //
-
     var config: HackRFConfig = .{};
+    config.connect_requested = true;
 
-    //
-    // FFT setup
-    //
+    var analyzer = try SpectrumAnalyzer.init(alloc, 7, 3, config.cf_mhz, config.fsHz(), 256);
+    defer analyzer.deinit();
 
-    const fft_size_values = [_]u32{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
-    const fft_size_labels: [:0]const u8 = "64\x00128\x00256\x00512\x001024\x002048\x004096\x008192\x00";
+    var wf_gpu = WaterfallGpu.init(gpu_device, analyzer.fftSize(), 256);
+    defer wf_gpu.deinit();
 
-    var fft_size_index: i32 = 7;
-    const default_fft_size = fft_size_values[@intCast(fft_size_index)];
-
-    var refit_x = true;
-
-    var fft = try SimpleFFT.init(alloc, default_fft_size, config.cf_mhz * 1e6, @floatCast(config.fsHz()), .NONE);
-    defer fft.deinit(alloc);
-
-    var fft_buf: [][2]f32 = try alloc.alloc([2]f32, default_fft_size);
-    defer alloc.free(fft_buf);
-
-    // Waterfall state
-    var waterfall = try Waterfall.init(alloc, default_fft_size, 256);
-    defer waterfall.deinit(alloc);
-
-    // SDL3 GPU texture state for waterfall
-    var wf_gpu_texture: ?*c.SDL_GPUTexture = null;
-    var wf_sampler: ?*c.SDL_GPUSampler = null;
-    var wf_transfer_buf: ?*c.SDL_GPUTransferBuffer = null;
-    var wf_tex_w: u32 = 0;
-    var wf_tex_h: u32 = 0;
-    var wf_binding: c.SDL_GPUTextureSamplerBinding = .{ .texture = null, .sampler = null };
-
-    // Create initial waterfall texture
-    createWaterfallTexture(gpu_device, default_fft_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
-    defer destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
-
-    const fft_target_fps: i32 = 30;
-    const fft_frame_interval_us: u64 = 1_000_000 / @as(u64, @intCast(fft_target_fps));
-    var last_fft_time_us: u64 = zsdl.getTicks() * 1000;
-
-    //
-    // CF follow / rate-limit state
-    //
     var last_retune_time_ms: u64 = 0;
-
-    //
-    // Peak hold state
-    //
-    var peak_hold_enabled: bool = false;
-    var peak_hold_data: []f32 = try alloc.alloc(f32, default_fft_size);
-    defer alloc.free(peak_hold_data);
-    @memset(peak_hold_data, -200.0);
-    var peak_decay_rate: f32 = 1.6; // dB/s, 0 = classic hold (no decay)
-    var last_peak_time_ms: u64 = 0;
-
-    //
-    // EMA state
-    //
-    var avg_count: i32 = 2; // 1 = no averaging
-    var ema_data: []f32 = try alloc.alloc(f32, default_fft_size);
-    defer alloc.free(ema_data);
-    @memset(ema_data, -200.0);
-    var ema_initialized: bool = false;
-
-    // Window function state
-    var window_index: i32 = 3; // BLACKMAN_HARRIS
-
-    //
-    // Main loop
-    //
 
     var running = true;
     while (running) {
         {
-            //
-            // Handle OS events
-            //
-
             var event: zsdl.Event = undefined;
             while (zsdl.pollEvent(&event)) {
                 _ = zgui.backend.processEvent(@ptrCast(&event));
@@ -336,80 +272,16 @@ pub fn main() !void {
             }
         }
 
-        {
-            //
-            // SDR Update
-            //
+        if (sdr != null) {
+            _ = analyzer.processFrame(&sdr.?.mutex, &sdr.?.rx_buffer);
+        }
 
-            if (sdr != null) {
-                // FFT update
-                const current_time_us = zsdl.getTicks() * 1000;
-                if ((current_time_us - last_fft_time_us >= fft_frame_interval_us) and sdr.?.mutex.tryLock()) {
-                    last_fft_time_us = current_time_us;
-                    const fft_slice = fft_buf[0..fft.fft_size];
-
-                    const copied = sdr.?.rx_buffer.copyNewest(fft_slice);
-                    sdr.?.mutex.unlock();
-
-                    if (copied == fft.fft_size) {
-                        fft.calc(fft_slice);
-
-                        // EMA processing
-                        const alpha: f32 = 1.0 / @as(f32, @floatFromInt(avg_count));
-                        if (alpha < 1.0) {
-                            if (!ema_initialized) {
-                                @memcpy(ema_data[0..fft.fft_size], fft.fft_mag[0..fft.fft_size]);
-                                ema_initialized = true;
-                            } else {
-                                for (0..fft.fft_size) |i| {
-                                    ema_data[i] = alpha * fft.fft_mag[i] + (1.0 - alpha) * ema_data[i];
-                                }
-                            }
-                        }
-
-                        // Peak hold
-                        if (peak_hold_enabled) {
-                            const src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
-                            // Time-based decay
-                            const now_ms = zsdl.getTicks();
-                            if (last_peak_time_ms > 0 and peak_decay_rate > 0) {
-                                const dt: f32 = @floatFromInt(now_ms - last_peak_time_ms);
-                                const decay = peak_decay_rate * dt / 1000.0;
-                                for (0..fft.fft_size) |i| {
-                                    peak_hold_data[i] -= decay;
-                                }
-                            }
-                            last_peak_time_ms = now_ms;
-                            for (0..fft.fft_size) |i| {
-                                peak_hold_data[i] = @max(peak_hold_data[i], src[i]);
-                            }
-                        }
-
-                        // Waterfall push
-                        const wf_src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
-                        waterfall.pushRow(wf_src);
-                    }
-                }
-            }
+        if (analyzer.waterfall.dirty) {
+            analyzer.waterfall.renderPixels();
+            wf_gpu.upload(&analyzer.waterfall);
         }
 
         {
-            //
-            // Waterfall view update
-            //
-
-            // Upload waterfall pixels to GPU if dirty
-            if (waterfall.dirty and wf_transfer_buf != null) {
-                waterfall.renderPixels();
-                uploadWaterfallTexture(gpu_device, &waterfall, wf_gpu_texture, wf_transfer_buf, wf_tex_w, wf_tex_h);
-            }
-        }
-
-        {
-            //
-            // Render
-            //
-
             const cmd_buf = c.SDL_AcquireGPUCommandBuffer(gpu_device) orelse continue;
 
             var swapchain_texture: ?*c.SDL_GPUTexture = null;
@@ -448,8 +320,7 @@ pub fn main() !void {
                     if (sdr != null) {
                         config.readDeviceInfo(sdr.?.device);
                         config.applyAll(sdr.?.device);
-                        fft.updateFreqs(config.cf_mhz * 1e6, @floatCast(config.fsHz()));
-                        refit_x = true;
+                        analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                         try sdr.?.startRx();
                     }
                 }
@@ -461,141 +332,70 @@ pub fn main() !void {
                     sdr = null;
                     config.clearDeviceInfo();
                     config.connect_error_msg = null;
-                    @memset(fft.fft_mag, 0);
-                    waterfall.clear();
+                    analyzer.resetAll();
                 }
 
                 if (config.freq_changed) {
                     config.freq_changed = false;
-                    fft.updateFreqs(config.cf_mhz * 1e6, @floatCast(config.fsHz()));
-                    refit_x = true;
-                    ema_initialized = false;
+                    analyzer.updateFreqs(config.cf_mhz, config.fsHz());
+                    analyzer.resetSmoothing();
                 }
 
                 if (config.sample_rate_changed) {
                     config.sample_rate_changed = false;
-                    fft.updateFreqs(config.cf_mhz * 1e6, @floatCast(config.fsHz()));
-                    refit_x = true;
+                    analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                 }
 
-                zgui.setNextWindowPos(.{ .x = 360, .y = 10, .cond = .first_use_ever });
-                zgui.setNextWindowSize(.{ .w = 340, .h = 400, .cond = .first_use_ever });
-
-                if (zgui.begin(zgui.formatZ("Analysis ({d:.0} fps)###Analysis", .{zgui.io.getFramerate()}), .{})) {
-                    if (zgui.combo("FFT Size", .{
-                        .current_item = &fft_size_index,
-                        .items_separated_by_zeros = fft_size_labels,
-                    })) {
-                        const new_size = fft_size_values[@intCast(fft_size_index)];
-                        fft.deinit(alloc);
-                        fft = try SimpleFFT.init(alloc, new_size, config.cf_mhz * 1e6, @floatCast(config.fsHz()), @enumFromInt(window_index));
-
-                        fft_buf = try alloc.realloc(fft_buf, new_size);
-
-                        waterfall.deinit(alloc);
-                        waterfall = try Waterfall.init(alloc, new_size, 256);
-                        destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
-                        createWaterfallTexture(gpu_device, new_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
-
-                        peak_hold_data = try alloc.realloc(peak_hold_data, new_size);
-                        @memset(peak_hold_data, -200.0);
-
-                        ema_data = try alloc.realloc(ema_data, new_size);
-                        @memset(ema_data, -200.0);
-                        ema_initialized = false;
-                    }
-
-                    if (zgui.combo("Window", .{
-                        .current_item = &window_index,
-                        .items_separated_by_zeros = @import("simple_fft.zig").window_labels,
-                    })) {
-                        fft.setWindow(@enumFromInt(window_index));
-                    }
-
-                    if (zgui.sliderInt("Averages", .{ .min = 1, .max = 100, .v = &avg_count })) {
-                        if (avg_count <= 1) {
-                            ema_initialized = false;
-                        }
-                    }
-
-                    _ = zgui.checkbox("Peak Hold", .{ .v = &peak_hold_enabled });
-                    zgui.sameLine(.{});
-                    if (zgui.button("Reset Peak", .{})) {
-                        @memset(peak_hold_data, -200.0);
-                        last_peak_time_ms = 0;
-                    }
-                    _ = zgui.sliderFloat("Peak Decay (dB/s)", .{ .min = 0, .max = 100, .v = &peak_decay_rate });
-
-                    zgui.separatorText("Waterfall");
-                    if (zgui.sliderFloat("dB Min", .{ .min = -160, .max = 0, .v = &waterfall.db_min })) {
-                        waterfall.rebuildLut();
-                        waterfall.dirty = true;
-                    }
-                    if (zgui.sliderFloat("dB Max", .{ .min = -160, .max = 0, .v = &waterfall.db_max })) {
-                        waterfall.rebuildLut();
-                        waterfall.dirty = true;
-                    }
+                const ui_result = try analyzer.renderUi(zgui.io.getFramerate(), config.cf_mhz, config.fsHz());
+                if (ui_result.resized) {
+                    wf_gpu.resize(ui_result.new_fft_size, 256);
                 }
-                zgui.end();
 
                 zgui.setNextWindowPos(.{ .x = 683, .y = 109, .cond = .first_use_ever });
                 zgui.setNextWindowSize(.{ .w = 1149, .h = 810, .cond = .first_use_ever });
 
-                if (zgui.begin("Data View", .{
-                    .flags = .{},
-                })) {
+                if (zgui.begin("Data View", .{})) {
                     const avail = zgui.getContentRegionAvail();
                     const line_h = avail[1] * 0.35;
                     const wf_h = avail[1] * 0.60;
 
-                    // Build series for plot
-                    const alpha: f32 = 1.0 / @as(f32, @floatFromInt(avg_count));
-                    const display_data = if (alpha < 1.0 and ema_initialized) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
+                    const display_data = analyzer.displayData();
+                    const freq_data = analyzer.freqData();
 
                     var series_buf: [2]plot.PlotSeries = undefined;
                     var series_count: usize = 0;
 
                     series_buf[series_count] = .{
                         .label = "Magnitude",
-                        .x_data = fft.fft_freqs[0..fft.fft_size],
+                        .x_data = freq_data,
                         .y_data = display_data,
                     };
                     series_count += 1;
 
-                    if (peak_hold_enabled) {
+                    if (analyzer.peak_hold_enabled) {
                         series_buf[series_count] = .{
                             .label = "Peak Hold",
-                            .x_data = fft.fft_freqs[0..fft.fft_size],
-                            .y_data = peak_hold_data[0..fft.fft_size],
+                            .x_data = freq_data,
+                            .y_data = analyzer.peak_hold_data[0..analyzer.fftSize()],
                             .color = .{ 1.0, 0.2, 0.2, 0.8 },
                             .line_weight = 1.0,
                         };
                         series_count += 1;
                     }
 
-                    // Compute x_range from frequency array
-                    const x_range: ?[2]f64 = if (fft.fft_freqs.len > 0) .{
-                        @floatCast(fft.fft_freqs[0]),
-                        @floatCast(fft.fft_freqs[fft.fft_size - 1]),
-                    } else null;
-
-                    const overlay: ?[:0]const u8 = null;
-
-                    // FFT line plot (top portion)
                     const plot_result = plot.render(
                         "FFT",
                         "Freq (MHz)",
                         "dB",
                         series_buf[0..series_count],
                         .{ -120.0, 0.0 },
-                        x_range,
-                        refit_x,
+                        analyzer.xRange(),
+                        analyzer.refit_x,
                         line_h,
-                        overlay,
+                        null,
                     );
-                    refit_x = false;
+                    analyzer.refit_x = false;
 
-                    // CF follow: rate-limited retune on horizontal pan (max 10 Hz)
                     if (sdr != null and plot_result.hovered) {
                         const plot_center = (plot_result.limits.x_min + plot_result.limits.x_max) / 2.0;
                         const cf_mhz: f64 = @floatCast(config.cf_mhz);
@@ -609,19 +409,17 @@ pub fn main() !void {
                                 if (new_cf_hz > 0) {
                                     sdr.?.device.setFreq(new_cf_hz) catch {};
                                     config.cf_mhz = @floatCast(plot_center);
-                                    fft.updateFreqs(@floatCast(plot_center * 1e6), @floatCast(config.fsHz()));
-                                    ema_initialized = false;
-                                    refit_x = true;
+                                    analyzer.updateFreqs(config.cf_mhz, config.fsHz());
+                                    analyzer.resetSmoothing();
                                 }
                             }
                         }
                     }
 
-                    // Waterfall image (bottom portion), aligned to FFT plot data area
-                    if (wf_binding.texture != null) {
+                    if (wf_gpu.binding.texture != null) {
                         const tex_ref = zgui.TextureRef{
                             .tex_data = null,
-                            .tex_id = @enumFromInt(@intFromPtr(&wf_binding)),
+                            .tex_id = @enumFromInt(@intFromPtr(&wf_gpu.binding)),
                         };
                         const window_pos = zgui.getWindowPos();
                         const plot_left_local = plot_result.plot_pos[0] - window_pos[0];

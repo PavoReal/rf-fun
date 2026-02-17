@@ -12,6 +12,13 @@ const c = @cImport({
     @cInclude("SDL3/SDL.h");
 });
 
+fn lookupErrMsg(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NoDeviceFound => "No devices found ",
+        else => @errorName(err),
+    };
+}
+
 fn sdrRxCallback(trans: hackrf.Transfer, state: *SDR) hackrf.StreamAction {
     state.mutex.lock();
     defer state.mutex.unlock();
@@ -55,7 +62,7 @@ const SDR = struct {
         var list = try hackrf.DeviceList.get();
         defer list.deinit();
 
-        if (list.count() == 0) return self;
+        if (list.count() == 0) return error.NoDeviceFound;
 
         self.device = try hackrf.Device.open();
         _ = try self.device.versionStringRead(&self.version_str);
@@ -292,8 +299,8 @@ pub fn main() !void {
     createWaterfallTexture(gpu_device, default_fft_size, 256, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf, &wf_tex_w, &wf_tex_h, &wf_binding);
     defer destroyWaterfallTexture(gpu_device, &wf_gpu_texture, &wf_sampler, &wf_transfer_buf);
 
-    var fft_target_fps: i32 = 60;
-    var fft_frame_interval_us: u64 = 1_000_000 / 60;
+    var fft_target_fps: i32 = 30;
+    var fft_frame_interval_us: u64 = 1_000_000 / @as(u64, @intCast(fft_target_fps));
     var last_fft_time_us: u64 = zsdl.getTicks() * 1000;
 
     //
@@ -327,10 +334,11 @@ pub fn main() !void {
     @memset(ema_data, -200.0);
     var ema_initialized: bool = false;
 
-    //
     // Window function state
-    //
     var window_index: i32 = 3; // BLACKMAN_HARRIS
+
+    var sdr_connect_err: bool = false;
+    var sdr_connect_err_msg: []const u8 = undefined;
 
     //
     // Main loop
@@ -360,11 +368,10 @@ pub fn main() !void {
             if (sdr != null) {
                 // FFT update
                 const current_time_us = zsdl.getTicks() * 1000;
-                if (current_time_us - last_fft_time_us >= fft_frame_interval_us) {
+                if ((current_time_us - last_fft_time_us >= fft_frame_interval_us) and sdr.?.mutex.tryLock()) {
                     last_fft_time_us = current_time_us;
                     const fft_slice = fft_buf[0..fft.fft_size];
 
-                    sdr.?.mutex.lock();
                     const copied = sdr.?.rx_buffer.copyNewest(fft_slice);
                     sdr.?.mutex.unlock();
 
@@ -406,9 +413,7 @@ pub fn main() !void {
                         const wf_src = if (alpha < 1.0) ema_data[0..fft.fft_size] else fft.fft_mag[0..fft.fft_size];
                         waterfall.pushRow(wf_src);
                     }
-
                 }
-
             }
         }
 
@@ -578,9 +583,22 @@ pub fn main() !void {
                         if (zgui.button("Connect", .{})) {
                             const cf_hz: u64 = @intFromFloat(cf_slider * 1e6);
                             const fs_hz: f64 = sample_rate_values[@intCast(fs_index)];
-                            sdr = try SDR.init(alloc, cf_hz, fs_hz);
-                            try sdr.?.startRx();
-                            fft.updateFreqs(cf_slider * 1e6, @floatCast(fs_hz));
+
+                            sdr = SDR.init(alloc, cf_hz, fs_hz) catch |err| blk: {
+                                sdr_connect_err = true;
+                                sdr_connect_err_msg = lookupErrMsg(err);
+                                break :blk null;
+                            };
+
+                            if (!sdr_connect_err) {
+                                try sdr.?.startRx();
+                                sdr_connect_err = false;
+                                fft.updateFreqs(cf_slider * 1e6, @floatCast(fs_hz));
+                            }
+                        }
+
+                        if (sdr_connect_err) {
+                            zgui.textColored(.{ 0.9, 0.1, 0.1, 1 }, "Connection Error: {s}", .{sdr_connect_err_msg});
                         }
                     }
                 }

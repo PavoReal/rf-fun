@@ -5,6 +5,16 @@ const zgui = @import("zgui");
 pub const sample_rate_values = [_]f64{ 2e6, 4e6, 8e6, 10e6, 16e6, 20e6 };
 pub const sample_rate_labels: [:0]const u8 = "2 MHz\x004 MHz\x008 MHz\x0010 MHz\x0016 MHz\x0020 MHz\x00";
 
+pub const rx_buf_size_values = [_]usize{
+    500_000, 1_000_000, 2_000_000, 4_000_000,
+    8_000_000, 16_000_000, 32_000_000, 64_000_000,
+    128_000_000, 256_000_000, 512_000_000,
+};
+const rx_buf_size_labels: [:0]const u8 =
+    "1 MB (500K)\x002 MB (1M)\x004 MB (2M)\x008 MB (4M)\x00" ++
+    "16 MB (8M)\x0032 MB (16M)\x0064 MB (32M)\x00128 MB (64M)\x00" ++
+    "256 MB (128M)\x00512 MB (256M)\x001 GB (512M)\x00";
+
 const bb_filter_values = [_]u32{
     1750000,  2500000,  3500000,  5000000,
     5500000,  6000000,  7000000,  8000000,
@@ -17,12 +27,12 @@ const bb_filter_labels: [:0]const u8 =
     "15 MHz\x0020 MHz\x0024 MHz\x0028 MHz\x00";
 
 pub const HackRFConfig = struct {
-    cf_mhz: f32 = 2400.0,
-    sample_rate_index: i32 = 5,
+    cf_mhz: f32 = 100.0,
+    sample_rate_index: i32 = 3,
     bb_filter_index: i32 = 0,
 
-    lna_gain: i32 = 0,
-    vga_gain: i32 = 0,
+    lna_gain: i32 = 16,
+    vga_gain: i32 = 16,
     amp_enable: bool = false,
 
     clkout_enable: bool = false,
@@ -40,6 +50,9 @@ pub const HackRFConfig = struct {
     version_str: [256]u8 = std.mem.zeroes([256]u8),
     version_len: usize = 0,
 
+    rx_buf_size_index: i32 = 7,
+    rx_buf_size_changed: bool = false,
+
     freq_changed: bool = false,
     sample_rate_changed: bool = false,
     connect_requested: bool = false,
@@ -55,6 +68,10 @@ pub const HackRFConfig = struct {
 
     pub fn fsHz(self: *const HackRFConfig) f64 {
         return sample_rate_values[@intCast(self.sample_rate_index)];
+    }
+
+    pub fn rxBufSamples(self: *const HackRFConfig) usize {
+        return rx_buf_size_values[@intCast(self.rx_buf_size_index)];
     }
 
     pub fn readDeviceInfo(self: *HackRFConfig, device: hackrf.Device) void {
@@ -117,7 +134,7 @@ pub const HackRFConfig = struct {
         zgui.setNextWindowPos(.{ .x = 10, .y = 10, .cond = .first_use_ever });
         zgui.setNextWindowSize(.{ .w = 340, .h = 650, .cond = .first_use_ever });
 
-        if (!zgui.begin("HackRF Config###HackRF Config", .{})) {
+        if (!zgui.begin("Config###HackRF Config", .{})) {
             zgui.end();
             return;
         }
@@ -286,6 +303,15 @@ pub const HackRFConfig = struct {
         }
 
         if (disabled) zgui.endDisabled();
+
+        zgui.separatorText("Buffer");
+
+        if (zgui.combo("RX Buffer Size", .{
+            .current_item = &self.rx_buf_size_index,
+            .items_separated_by_zeros = rx_buf_size_labels,
+        })) {
+            self.rx_buf_size_changed = true;
+        }
     }
 
     const theme_labels: [:0]const u8 = "Dark\x00Light\x00Classic\x00";

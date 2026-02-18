@@ -8,6 +8,7 @@ pub fn FixedSizeRingBuffer(comptime T: type) type {
         buf: []T,
         head: usize,
         count: usize,
+        total_written: usize = 0,
 
         pub fn init(allocator: Allocator, cap: usize) Allocator.Error!Self {
             return .{
@@ -22,19 +23,27 @@ pub fn FixedSizeRingBuffer(comptime T: type) type {
             self.* = undefined;
         }
 
+        pub fn resize(self: *Self, allocator: Allocator, new_cap: usize) Allocator.Error!void {
+            const new_buf = try allocator.alloc(T, new_cap);
+            allocator.free(self.buf);
+            self.buf = new_buf;
+            self.head = 0;
+            self.count = 0;
+            self.total_written = 0;
+        }
+
         pub fn append(self: *Self, items: []const T) void {
             const cap = self.buf.len;
             if (items.len == 0) return;
 
             if (items.len >= cap) {
-                // Input larger than buffer — keep only the last `cap` items
                 @memcpy(self.buf[0..cap], items[items.len - cap ..]);
                 self.head = 0;
                 self.count = cap;
+                self.total_written +%= items.len;
                 return;
             }
 
-            // Two-part copy: [head..end] then [0..wrap]
             const first_len = @min(items.len, cap - self.head);
             @memcpy(self.buf[self.head..][0..first_len], items[0..first_len]);
             const remaining = items.len - first_len;
@@ -43,12 +52,14 @@ pub fn FixedSizeRingBuffer(comptime T: type) type {
             }
             self.head = (self.head + items.len) % cap;
             self.count = @min(self.count + items.len, cap);
+            self.total_written +%= items.len;
         }
 
         pub fn appendOne(self: *Self, item: T) void {
             self.buf[self.head] = item;
             self.head = (self.head + 1) % self.buf.len;
             if (self.count < self.buf.len) self.count += 1;
+            self.total_written +%= 1;
         }
 
         pub fn capacity(self: Self) usize {
@@ -101,6 +112,45 @@ pub fn FixedSizeRingBuffer(comptime T: type) type {
             }
             const from_first = want - s.second.len;
             return .{ .first = s.first[s.first.len - from_first ..], .second = s.second };
+        }
+
+        /// Copy sequential samples starting from a read cursor (sequence number).
+        /// The cursor tracks how many total samples have been consumed.
+        /// If the reader falls behind and data was overwritten, the cursor
+        /// jumps to the oldest available data.
+        /// Returns the number of samples actually copied.
+        pub fn copySequential(self: Self, read_cursor: *usize, dest: []T) usize {
+            if (self.count == 0 or dest.len == 0) return 0;
+
+            const cap = self.buf.len;
+            const tw = self.total_written;
+            var seq = read_cursor.*;
+
+            if (seq > tw) {
+                seq = tw -% self.count;
+            }
+
+            var available = tw -% seq;
+
+            if (available > self.count) {
+                seq = tw -% self.count;
+                available = self.count;
+            }
+
+            if (available == 0) return 0;
+
+            const to_copy = @min(available, dest.len);
+
+            const start_pos = (self.head -% available +% cap) % cap;
+            const first_len = @min(to_copy, cap - start_pos);
+            @memcpy(dest[0..first_len], self.buf[start_pos..][0..first_len]);
+            const remaining = to_copy - first_len;
+            if (remaining > 0) {
+                @memcpy(dest[first_len..][0..remaining], self.buf[0..remaining]);
+            }
+
+            read_cursor.* = seq +% to_copy;
+            return to_copy;
         }
 
         /// Copy up to `dest.len` of the newest elements into `dest` contiguously.
@@ -446,4 +496,106 @@ test "works with extern struct type" {
     const s = rb.slices();
     try testing.expectEqual(@as(i8, 1), s.first[0].i);
     try testing.expectEqual(@as(i8, 4), s.first[1].q);
+}
+
+// === copySequential tests ===
+
+test "copySequential basic sequential reads" {
+    var rb = try RingBuf.init(testing.allocator, 8);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 10, 20, 30, 40, 50 });
+
+    var cursor: usize = 0;
+    var dest: [3]u8 = undefined;
+
+    const n1 = rb.copySequential(&cursor, &dest);
+    try testing.expectEqual(@as(usize, 3), n1);
+    try testing.expectEqualSlices(u8, &.{ 10, 20, 30 }, &dest);
+
+    const n2 = rb.copySequential(&cursor, &dest);
+    try testing.expectEqual(@as(usize, 2), n2);
+    try testing.expectEqualSlices(u8, &.{ 40, 50 }, dest[0..2]);
+
+    const n3 = rb.copySequential(&cursor, &dest);
+    try testing.expectEqual(@as(usize, 0), n3);
+}
+
+test "copySequential with wrap-around" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2, 3, 4 });
+    var cursor: usize = 0;
+
+    // Read first 2
+    var dest: [2]u8 = undefined;
+    const n1 = rb.copySequential(&cursor, &dest);
+    try testing.expectEqual(@as(usize, 2), n1);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, &dest);
+
+    // Write more, causing wrap
+    rb.append(&.{ 5, 6 });
+    // Buffer now: [5, 6, 3, 4], head=2, oldest=[3,4,5,6]
+    // cursor=2 which points at 3
+
+    var dest4: [4]u8 = undefined;
+    const n2 = rb.copySequential(&cursor, &dest4);
+    try testing.expectEqual(@as(usize, 4), n2);
+    try testing.expectEqualSlices(u8, &.{ 3, 4, 5, 6 }, &dest4);
+}
+
+test "copySequential cursor falls behind (overwritten)" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    rb.append(&.{ 1, 2, 3, 4 });
+    var cursor: usize = 0;
+
+    // Read 1 element, cursor is now at 1
+    var dest1: [1]u8 = undefined;
+    _ = rb.copySequential(&cursor, &dest1);
+    try testing.expectEqual(@as(usize, 1), cursor);
+
+    // Write 5 more elements — cursor at 1 is now overwritten
+    rb.append(&.{ 5, 6, 7, 8, 9 });
+    // Buffer: [9, 6, 7, 8], head=1, oldest starts at 1 -> [6,7,8,9]
+
+    var dest4: [4]u8 = undefined;
+    const n = rb.copySequential(&cursor, &dest4);
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqualSlices(u8, &.{ 6, 7, 8, 9 }, &dest4);
+}
+
+test "copySequential empty buffer" {
+    var rb = try RingBuf.init(testing.allocator, 4);
+    defer rb.deinit(testing.allocator);
+
+    var cursor: usize = 0;
+    var dest: [4]u8 = undefined;
+    const n = rb.copySequential(&cursor, &dest);
+    try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "copySequential incremental with new data" {
+    var rb = try RingBuf.init(testing.allocator, 8);
+    defer rb.deinit(testing.allocator);
+
+    var cursor: usize = 0;
+    var dest: [4]u8 = undefined;
+
+    rb.append(&.{ 1, 2 });
+    const n1 = rb.copySequential(&cursor, &dest);
+    try testing.expectEqual(@as(usize, 2), n1);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, dest[0..2]);
+
+    // No new data
+    const n2 = rb.copySequential(&cursor, &dest);
+    try testing.expectEqual(@as(usize, 0), n2);
+
+    // Add more
+    rb.append(&.{ 3, 4, 5 });
+    const n3 = rb.copySequential(&cursor, &dest);
+    try testing.expectEqual(@as(usize, 3), n3);
+    try testing.expectEqualSlices(u8, &.{ 3, 4, 5 }, dest[0..3]);
 }

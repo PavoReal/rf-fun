@@ -7,6 +7,13 @@ const util = @import("util.zig");
 const HackRFConfig = @import("hackrf_config.zig").HackRFConfig;
 const SpectrumAnalyzer = @import("spectrum_analyzer.zig").SpectrumAnalyzer;
 const signal_stats = @import("signal_stats.zig");
+const SaveManager = @import("save_manager.zig").SaveManager;
+const stats_window_mod = @import("stats_window.zig");
+const StatsWindow = stats_window_mod.StatsWindow;
+const PipelineInfo = stats_window_mod.PipelineInfo;
+const radio_decoder_mod = @import("radio_decoder.zig");
+const RadioDecoder = radio_decoder_mod.RadioDecoder;
+const ModulationType = radio_decoder_mod.ModulationType;
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -43,7 +50,7 @@ const SDR = struct {
 
     rx_buffer: FixedSizeRingBuffer(hackrf.IQSample) = undefined,
 
-    pub fn init(alloc: std.mem.Allocator) !Self {
+    pub fn init(alloc: std.mem.Allocator, rx_buf_samples: usize) !Self {
         var self = Self{};
         try hackrf.init();
 
@@ -55,9 +62,20 @@ const SDR = struct {
         self.device = try hackrf.Device.open();
         self.device.stopTx() catch {};
 
-        self.rx_buffer = try FixedSizeRingBuffer(hackrf.IQSample).init(alloc, util.mb(64));
+        self.rx_buffer = try FixedSizeRingBuffer(hackrf.IQSample).init(alloc, rx_buf_samples);
 
         return self;
+    }
+
+    pub fn resizeBuffer(self: *Self, alloc: std.mem.Allocator, new_count: usize) !void {
+        const new_buf = try alloc.alloc(hackrf.IQSample, new_count);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        alloc.free(self.rx_buffer.buf);
+        self.rx_buffer.buf = new_buf;
+        self.rx_buffer.head = 0;
+        self.rx_buffer.count = 0;
+        self.rx_bytes_received = 0;
     }
 
     pub fn startRx(self: *Self) !void {
@@ -228,6 +246,8 @@ fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
     _ = zgui.dockBuilderSplitNode(top_id, .left, 0.6, &analysis_id, &stats_id);
 
     zgui.dockBuilderDockWindow("###HackRF Config", left_id);
+    zgui.dockBuilderDockWindow("###Save", left_id);
+    zgui.dockBuilderDockWindow("###Radio Decoder", left_id);
     zgui.dockBuilderDockWindow("###Analysis", analysis_id);
     zgui.dockBuilderDockWindow("###Stats", stats_id);
     zgui.dockBuilderDockWindow("###Data View", bottom_id);
@@ -242,7 +262,7 @@ pub fn main() !void {
 
     var sdr: ?SDR = null;
 
-    try zsdl.init(.{ .video = true, .events = true });
+    try zsdl.init(.{ .video = true, .events = true, .audio = true });
     defer zsdl.quit();
 
     const window = try zsdl.createWindow("rf-fun", 800, 600, .{ .resizable = true, .high_pixel_density = true, .maximized = true });
@@ -264,8 +284,8 @@ pub fn main() !void {
     zgui.init(alloc);
     defer zgui.deinit();
 
-    zgui.io.setIniFilename(null);
-    zgui.io.setConfigFlags(.{.dock_enable = true});
+    //zgui.io.setIniFilename(null);
+    zgui.io.setConfigFlags(.{ .dock_enable = true });
 
     zgui.plot.init();
     defer zgui.plot.deinit();
@@ -281,14 +301,21 @@ pub fn main() !void {
 
     var config: HackRFConfig = .{};
     config.connect_requested = true;
-    config.amp_enable = true;
+
+    var save_mgr: SaveManager = .{};
 
     var analyzer = try SpectrumAnalyzer.init(alloc, 7, 3, config.cf_mhz, config.fsHz(), 256);
     defer analyzer.deinit();
 
+    var radio_decoder = try RadioDecoder.init(alloc, config.fsHz(), config.cf_mhz);
+    defer radio_decoder.deinit();
+
     var wf_gpu = WaterfallGpu.init(gpu_device, analyzer.fftSize(), 256);
     defer wf_gpu.deinit();
 
+    var stats_win: StatsWindow = .{};
+
+    var drag_freq: f64 = radio_decoder.ui_freq_mhz;
     var last_retune_time_ms: u64 = 0;
     var dock_init_frames: u32 = 0;
 
@@ -354,11 +381,19 @@ pub fn main() !void {
             {
                 config.render(if (sdr != null) sdr.?.device else null);
 
+                save_mgr.render(
+                    if (sdr != null) &sdr.?.mutex else null,
+                    if (sdr != null) &sdr.?.rx_buffer else null,
+                    &config,
+                    alloc,
+                    @ptrCast(window),
+                );
+
                 if (config.connect_requested) {
                     config.connect_requested = false;
                     config.connect_error_msg = null;
 
-                    sdr = SDR.init(alloc) catch |err| blk: {
+                    sdr = SDR.init(alloc, config.rxBufSamples()) catch |err| blk: {
                         config.connect_error_msg = lookupErrMsg(err);
                         break :blk null;
                     };
@@ -367,13 +402,16 @@ pub fn main() !void {
                         config.readDeviceInfo(sdr.?.device);
                         config.applyAll(sdr.?.device);
                         analyzer.updateFreqs(config.cf_mhz, config.fsHz());
+                        radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
                         try sdr.?.startRx();
                         try analyzer.startThread(&sdr.?.mutex, &sdr.?.rx_buffer);
+                        try radio_decoder.start(&sdr.?.mutex, &sdr.?.rx_buffer);
                     }
                 }
 
                 if (config.disconnect_requested) {
                     config.disconnect_requested = false;
+                    radio_decoder.stop();
                     analyzer.stopThread();
                     sdr.?.rx_running = false;
                     try sdr.?.deinit(alloc);
@@ -387,12 +425,41 @@ pub fn main() !void {
                     config.freq_changed = false;
                     analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                     analyzer.resetSmoothing();
+                    radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
+                    drag_freq = radio_decoder.ui_freq_mhz;
                 }
 
                 if (config.sample_rate_changed) {
                     config.sample_rate_changed = false;
                     analyzer.updateFreqs(config.cf_mhz, config.fsHz());
+                    radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
+                    drag_freq = radio_decoder.ui_freq_mhz;
                 }
+
+                if (config.rx_buf_size_changed) {
+                    config.rx_buf_size_changed = false;
+                    if (sdr != null) {
+                        sdr.?.resizeBuffer(alloc, config.rxBufSamples()) catch {};
+                    }
+                }
+
+                radio_decoder.renderUi();
+
+                const pipelines = [_]PipelineInfo{
+                    .{
+                        .name = "Spectrum Analyzer",
+                        .pipeline = analyzer.pipelineView(),
+                        .thread_stats = analyzer.threadStats(),
+                        .dsp_rate = analyzer.dspRate(),
+                    },
+                    .{
+                        .name = "Radio Decoder",
+                        .pipeline = radio_decoder.pipelineView(),
+                        .thread_stats = radio_decoder.threadStats(),
+                        .dsp_rate = radio_decoder.dspRate(),
+                    },
+                };
+                stats_win.render(&pipelines, &analyzer.stats, analyzer.has_frame);
 
                 const ui_result = try analyzer.renderUi(zgui.io.getFramerate(), config.cf_mhz, config.fsHz());
                 if (ui_result.resized) {
@@ -402,7 +469,7 @@ pub fn main() !void {
                     }
                 }
 
-                if (zgui.begin("Data View###Data View", .{})) {
+                if (zgui.begin("FFT###Data View", .{})) {
                     const avail = zgui.getContentRegionAvail();
                     const line_h = avail[1] * 0.35;
                     const wf_h = avail[1] * 0.60;
@@ -433,7 +500,7 @@ pub fn main() !void {
 
                     var peak_x: [signal_stats.MAX_PEAKS]f32 = undefined;
                     var peak_y: [signal_stats.MAX_PEAKS]f32 = undefined;
-                    const num_peaks = @min(analyzer.stats.num_peaks, analyzer.num_display_peaks);
+                    const num_peaks = @min(analyzer.stats.num_peaks, stats_win.num_display_peaks);
                     for (0..num_peaks) |i| {
                         peak_x[i] = analyzer.stats.peaks[i].freq_mhz;
                         peak_y[i] = analyzer.stats.peaks[i].power_db;
@@ -449,6 +516,14 @@ pub fn main() !void {
                         marker_count = 1;
                     }
 
+                    const decode_band: ?plot.BandX = if (radio_decoder.ui_enabled) blk: {
+                        const mod: ModulationType = @enumFromInt(@as(u8, @intCast(radio_decoder.ui_modulation_index)));
+                        break :blk .{
+                            .center = drag_freq,
+                            .half_width = mod.bandwidthMhz() / 2.0,
+                        };
+                    } else null;
+
                     const plot_result = plot.render(
                         "FFT",
                         "Freq (MHz)",
@@ -460,8 +535,14 @@ pub fn main() !void {
                         analyzer.refit_x,
                         line_h,
                         null,
+                        if (radio_decoder.ui_enabled) .{ .value = &drag_freq } else null,
+                        decode_band,
                     );
                     analyzer.refit_x = false;
+
+                    if (plot_result.drag_line_moved) {
+                        radio_decoder.setFreqMhz(drag_freq);
+                    }
 
                     if (sdr != null and plot_result.hovered) {
                         const plot_center = (plot_result.limits.x_min + plot_result.limits.x_max) / 2.0;
@@ -478,6 +559,8 @@ pub fn main() !void {
                                     config.cf_mhz = @floatCast(plot_center);
                                     analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                                     analyzer.resetSmoothing();
+                                    radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
+                                    drag_freq = radio_decoder.ui_freq_mhz;
                                 }
                             }
                         }
@@ -528,6 +611,7 @@ pub fn main() !void {
     }
 
     if (sdr != null) {
+        radio_decoder.stop();
         analyzer.stopThread();
         sdr.?.rx_running = false;
         try sdr.?.deinit(alloc);

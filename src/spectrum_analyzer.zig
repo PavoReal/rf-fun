@@ -6,17 +6,30 @@ const window_labels = @import("simple_fft.zig").window_labels;
 const Waterfall = @import("waterfall.zig").Waterfall;
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const DspThread = @import("dsp/dsp_thread.zig").DspThread;
-const DcFilter = @import("dsp/dc_filter.zig").DcFilter;
+const DcFilter = @import("dsp/dc_filter.zig").DcFilter([2]f32);
 const DoubleBuffer = @import("dsp/double_buffer.zig").DoubleBuffer;
 const ps = @import("dsp/pipeline_stats.zig");
-const PipelineStats = ps.PipelineStats;
-const EmaAccumulator = ps.EmaAccumulator;
-const StageId = ps.StageId;
-const ThreadStats = ps.ThreadStats;
 const SignalStats = @import("signal_stats.zig").SignalStats;
-const PeakInfo = @import("signal_stats.zig").PeakInfo;
-const MAX_PEAKS = @import("signal_stats.zig").MAX_PEAKS;
 const zgui = @import("zgui");
+
+pub const SpectrumStageId = enum(u3) {
+    dc_filter = 0,
+    fft_compute = 1,
+    ema_avg = 2,
+    peak_hold = 3,
+    output = 4,
+};
+
+pub const spectrum_stage_labels: [std.enums.values(SpectrumStageId).len][:0]const u8 = .{
+    "DC Filter",
+    "FFT Compute",
+    "EMA Averaging",
+    "Peak Hold",
+    "Output",
+};
+
+const PipelineStats = ps.PipelineStats(SpectrumStageId);
+const EmaAccumulator = ps.EmaAccumulator(SpectrumStageId);
 
 pub const fft_size_values = [_]u32{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
 pub const fft_size_labels: [:0]const u8 = "64\x00128\x00256\x00512\x001024\x002048\x004096\x008192\x00";
@@ -103,7 +116,7 @@ pub const SpectrumWorker = struct {
             .alloc = alloc,
             .fft = fft,
             .fft_buf = fft_buf,
-            .avg_count = .init(2),
+            .avg_count = .init(1),
             .ema_data = ema_data,
             .ema_initialized = false,
             .peak_hold_enabled = .init(0),
@@ -283,7 +296,6 @@ pub const SpectrumAnalyzer = struct {
 
     stats: SignalStats,
     stats_scratch: []f32,
-    num_display_peaks: usize = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -563,146 +575,15 @@ pub const SpectrumAnalyzer = struct {
         }
         zgui.end();
 
-        self.renderStatsWindow();
-
         return result;
     }
 
-    fn renderStatsWindow(self: *Self) void {
-        if (zgui.begin("Stats###Stats", .{})) {
-            if (zgui.beginTabBar("stats_tabs", .{})) {
-                defer zgui.endTabBar();
-                if (zgui.beginTabItem("Signal Info", .{})) {
-                    defer zgui.endTabItem();
-                    self.renderSignalInfo();
-                }
-                if (zgui.beginTabItem("Pipeline", .{})) {
-                    defer zgui.endTabItem();
-                    self.renderPipelineStats();
-                }
-            }
-        }
-        zgui.end();
+    pub fn pipelineView(self: *const Self) ps.PipelineView {
+        return self.dsp_thread.worker.pipeline_stats.view(&spectrum_stage_labels);
     }
 
-    fn renderSignalInfo(self: *Self) void {
-        if (!self.has_frame) {
-            zgui.text("No data", .{});
-            return;
-        }
-
-        const s = self.stats;
-
-        zgui.separatorText("Overview");
-        zgui.text("Noise Floor: {d:.1} dB", .{s.noise_floor_db});
-        zgui.text("SNR:         {d:.1} dB", .{s.snr_db});
-
-        zgui.separatorText("Top Peaks");
-
-        if (zgui.smallButton("-")) {
-            self.num_display_peaks -|= 1;
-        }
-        zgui.sameLine(.{});
-        zgui.text("{d} Peaks", .{self.num_display_peaks});
-        zgui.sameLine(.{});
-        if (zgui.smallButton("+")) {
-            if (self.num_display_peaks < MAX_PEAKS) {
-                self.num_display_peaks += 1;
-            }
-        }
-
-        if (self.num_display_peaks == 0) {
-            zgui.text("No peak markers", .{});
-            return;
-        }
-
-        const display_count = @min(self.num_display_peaks, s.num_peaks);
-        if (display_count == 0) {
-            zgui.text("No peaks detected", .{});
-            return;
-        }
-
-        if (zgui.beginTable("peaks_table", .{
-            .column = 5,
-            .flags = .{ .borders = .{ .inner_h = true, .outer_h = true }, .row_bg = true, .sizing = .stretch_prop },
-        })) {
-            defer zgui.endTable();
-
-            zgui.tableSetupColumn("#", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 24 });
-            zgui.tableSetupColumn("Freq (MHz)", .{});
-            zgui.tableSetupColumn("Power (dB)", .{});
-            zgui.tableSetupColumn("Delta (dB)", .{});
-            zgui.tableSetupColumn("SNR (dB)", .{});
-            zgui.tableHeadersRow();
-
-            for (0..display_count) |i| {
-                zgui.tableNextRow(.{});
-                _ = zgui.tableNextColumn();
-                zgui.text("{d}", .{i + 1});
-                _ = zgui.tableNextColumn();
-                zgui.text("{d:.3}", .{s.peaks[i].freq_mhz});
-                _ = zgui.tableNextColumn();
-                zgui.text("{d:.1}", .{s.peaks[i].power_db});
-                _ = zgui.tableNextColumn();
-                zgui.text("{d:.1}", .{s.peaks[i].delta_db});
-                _ = zgui.tableNextColumn();
-                zgui.text("{d:.1}", .{s.peaks[i].snr_db});
-            }
-        }
-    }
-
-    fn renderPipelineStats(self: *const Self) void {
-        if (!self.has_frame) {
-            zgui.text("No data", .{});
-            return;
-        }
-
-        const stats = &self.dsp_thread.worker.pipeline_stats;
-        const tstats = &self.dsp_thread.thread_stats;
-
-        zgui.separatorText("Stage Timing");
-        if (zgui.beginTable("pipeline_stages", .{
-            .column = 2,
-            .flags = .{ .borders = .{ .inner_h = true, .outer_h = true }, .row_bg = true, .sizing = .stretch_prop },
-        })) {
-            defer zgui.endTable();
-
-            zgui.tableSetupColumn("Stage", .{});
-            zgui.tableSetupColumn("Time", .{});
-            zgui.tableHeadersRow();
-
-            for (0..ps.stage_count) |i| {
-                zgui.tableNextRow(.{});
-                _ = zgui.tableNextColumn();
-                zgui.text("{s}", .{ps.stage_labels[i]});
-                _ = zgui.tableNextColumn();
-                const ns = stats.stage_ns[i].load(.acquire);
-                const us: f64 = @as(f64, @floatFromInt(ns)) / 1000.0;
-                zgui.text("{d:.1} us", .{us});
-            }
-
-            zgui.tableNextRow(.{});
-            _ = zgui.tableNextColumn();
-            zgui.textColored(.{ 1.0, 1.0, 0.4, 1.0 }, "Total", .{});
-            _ = zgui.tableNextColumn();
-            const total_ns = stats.total_ns.load(.acquire);
-            const total_us: f64 = @as(f64, @floatFromInt(total_ns)) / 1000.0;
-            zgui.textColored(.{ 1.0, 1.0, 0.4, 1.0 }, "{d:.1} us", .{total_us});
-        }
-
-        zgui.separatorText("Thread");
-        const busy_raw = tstats.busy_pct.load(.acquire);
-        const busy: f64 = @as(f64, @floatFromInt(busy_raw)) / 100.0;
-        zgui.text("Utilization: {d:.2}%%", .{busy});
-
-        const iterations = tstats.iteration_count.load(.acquire);
-        zgui.text("Iterations:  {d}", .{iterations});
-
-        if (self.measured_dsp_rate) |rate| {
-            zgui.text("DSP Rate:    {d:.1} Hz", .{rate});
-        } else {
-            zgui.text("DSP Rate:    --", .{});
-        }
+    pub fn threadStats(self: *const Self) *const ps.ThreadStats {
+        return &self.dsp_thread.thread_stats;
     }
 
     fn computeFreqs(freqs: []f32, fft_size: u32, cf_mhz: f32, fs_hz: f64) void {

@@ -3,6 +3,16 @@ const zgui = @import("zgui");
 extern fn rfFunGetPlotLimits(x_min: *f64, x_max: *f64, y_min: *f64, y_max: *f64) void;
 extern fn rfFunGetPlotPos(x: *f32, y: *f32) void;
 extern fn rfFunGetPlotSize(w: *f32, h: *f32) void;
+extern fn rfFunDragLineX(id: c_int, value: *f64, r: f32, g: f32, b: f32, a: f32, thickness: f32) bool;
+extern fn rfFunPlotBandX(x_min: f64, x_max: f64, r: f32, g: f32, b: f32, a: f32) void;
+
+pub fn dragLineX(id: i32, value: *f64, color: [4]f32, thickness: f32) bool {
+    return rfFunDragLineX(id, value, color[0], color[1], color[2], color[3], thickness);
+}
+
+pub fn plotBandX(x_min: f64, x_max: f64, color: [4]f32) void {
+    rfFunPlotBandX(x_min, x_max, color[0], color[1], color[2], color[3]);
+}
 
 pub const PlotSeries = struct {
     label: [:0]const u8,
@@ -22,11 +32,24 @@ pub const PlotMarker = struct {
 
 pub const PlotLimits = struct { x_min: f64, x_max: f64 };
 
+pub const DragLine = struct {
+    value: *f64,
+    color: [4]f32 = .{ 0.0, 1.0, 0.5, 0.9 },
+    thickness: f32 = 2.0,
+};
+
+pub const BandX = struct {
+    center: f64,
+    half_width: f64,
+    color: [4]f32 = .{ 0.0, 1.0, 0.5, 0.15 },
+};
+
 pub const RenderResult = struct {
     limits: PlotLimits,
     hovered: bool,
     plot_pos: [2]f32,
     plot_size: [2]f32,
+    drag_line_moved: bool = false,
 };
 
 pub fn render(
@@ -40,6 +63,8 @@ pub fn render(
     refit_x: bool,
     height: f32,
     overlay_text: ?[:0]const u8,
+    drag_line: ?DragLine,
+    band: ?BandX,
 ) RenderResult {
     var result = RenderResult{
         .limits = .{ .x_min = 0, .x_max = 0 },
@@ -120,6 +145,16 @@ pub fn render(
                 .x = (xmin + xmax) / 2.0,
                 .y = (ymin + ymax) / 2.0,
             });
+        }
+
+        if (band) |b| {
+            plotBandX(b.center - b.half_width, b.center + b.half_width, b.color);
+        }
+
+        if (drag_line) |dl| {
+            if (dragLineX(0, dl.value, dl.color, dl.thickness)) {
+                result.drag_line_moved = true;
+            }
         }
 
         result.hovered = zgui.plot.isPlotHovered();

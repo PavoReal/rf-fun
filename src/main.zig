@@ -329,7 +329,7 @@ pub fn main() !void {
             zsdl.getWindowSize(window, &win_w, &win_h) catch {};
             const fb_scale: f32 = if (win_w > 0) @as(f32, @floatFromInt(sw_w)) / @as(f32, @floatFromInt(win_w)) else 1.0;
 
-            zgui.backend.newFrame(sw_w, sw_h, fb_scale);
+            zgui.backend.newFrame(@intCast(win_w), @intCast(win_h), fb_scale);
 
             const dockspace_id: zgui.Ident = 0xB00B1E5;
             if (dock_init_frames < 3) {

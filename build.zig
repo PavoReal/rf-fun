@@ -182,6 +182,14 @@ pub fn build(b: *std.Build) void {
     });
 
     //
+    // SDL3 from source (castholm/SDL)
+    //
+    const sdl_dep = b.dependency("sdl", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    //
     // root module
     //
 
@@ -224,30 +232,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(zgui_dep.path("libs/implot"));
 
     exe.root_module.addImport("zsdl3", zsdl_dep.module("zsdl3"));
-    exe.root_module.addIncludePath(zsdl_dep.path("libs/sdl3/include"));
-
-    // Link SDL3 using prebuilt binaries from zig-gamedev
-    if (os_tag == .windows) {
-        if (b.lazyDependency("sdl3_prebuilt_x86_64_windows_gnu", .{})) |sdl3_prebuilt| {
-            exe.root_module.addLibraryPath(sdl3_prebuilt.path("bin"));
-            b.getInstallStep().dependOn(&b.addInstallFileWithDir(
-                sdl3_prebuilt.path("bin/SDL3.dll"),
-                .bin,
-                "SDL3.dll",
-            ).step);
-        }
-        exe.root_module.linkSystemLibrary("SDL3", .{});
-    } else if (os_tag == .linux) {
-        if (b.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-            exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
-        }
-        exe.root_module.linkSystemLibrary("SDL3", .{});
-    } else if (is_darwin) {
-        if (b.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
-            exe.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
-        }
-        exe.root_module.linkFramework("SDL3", .{});
-    }
+    exe.root_module.linkLibrary(sdl_dep.artifact("SDL3"));
 
     if (os_tag == .windows) {
         exe.root_module.addIncludePath(b.path("deps/fftw-3.3.5-dll64"));

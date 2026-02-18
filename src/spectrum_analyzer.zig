@@ -8,6 +8,11 @@ const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const DspThread = @import("dsp/dsp_thread.zig").DspThread;
 const DcFilter = @import("dsp/dc_filter.zig").DcFilter;
 const DoubleBuffer = @import("dsp/double_buffer.zig").DoubleBuffer;
+const ps = @import("dsp/pipeline_stats.zig");
+const PipelineStats = ps.PipelineStats;
+const EmaAccumulator = ps.EmaAccumulator;
+const StageId = ps.StageId;
+const ThreadStats = ps.ThreadStats;
 const SignalStats = @import("signal_stats.zig").SignalStats;
 const PeakInfo = @import("signal_stats.zig").PeakInfo;
 const MAX_PEAKS = @import("signal_stats.zig").MAX_PEAKS;
@@ -62,6 +67,9 @@ pub const SpectrumWorker = struct {
     freq_dirty: std.atomic.Value(u8),
     window_dirty: std.atomic.Value(u8),
     reset_requested: std.atomic.Value(u8),
+
+    timing_ema: EmaAccumulator = EmaAccumulator.init(0.1),
+    pipeline_stats: PipelineStats = .{},
 
     pub fn init(alloc: std.mem.Allocator, fft_size: u32, cf_hz: f32, fs_hz: f32, window: WindowType) !Self {
         var fft = try SimpleFFT.init(alloc, fft_size, cf_hz, fs_hz, window);
@@ -137,6 +145,7 @@ pub const SpectrumWorker = struct {
             @memset(self.peak_hold_data[0..self.fft.fft_size], -200.0);
             self.last_work_time_ns = std.time.nanoTimestamp();
             self.dc_filter.reset();
+            self.timing_ema = EmaAccumulator.init(0.1);
         }
 
         if (self.freq_dirty.swap(0, .acquire) != 0) {
@@ -158,13 +167,21 @@ pub const SpectrumWorker = struct {
             out.* = sample.toFloat();
         }
 
+        // Stage 1: DC Filter
+        const t0: u64 = @intCast(std.time.nanoTimestamp());
         if (self.dc_filter_enabled.load(.acquire) != 0) {
             _ = self.dc_filter.process(fft_slice[0..samples_needed], self.dc_buf[0..samples_needed]);
             @memcpy(fft_slice[0..samples_needed], self.dc_buf[0..samples_needed]);
         }
+        const t1: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.dc_filter, t1 - t0);
 
+        // Stage 2: FFT Compute
         self.fft.calc(fft_slice);
+        const t2: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.fft_compute, t2 - t1);
 
+        // Stage 3: EMA Averaging
         const avg_count = self.avg_count.load(.acquire);
         const alpha: f32 = 1.0 / @as(f32, @floatFromInt(avg_count));
         if (alpha < 1.0) {
@@ -177,7 +194,10 @@ pub const SpectrumWorker = struct {
                 }
             }
         }
+        const t3: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.ema_avg, t3 - t2);
 
+        // Stage 4: Peak Hold
         const peak_enabled = self.peak_hold_enabled.load(.acquire) != 0;
         if (peak_enabled) {
             const src = if (alpha < 1.0) self.ema_data[0..fft_size] else self.fft.fft_mag[0..fft_size];
@@ -200,7 +220,10 @@ pub const SpectrumWorker = struct {
         } else {
             self.last_work_time_ns = std.time.nanoTimestamp();
         }
+        const t4: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.peak_hold, t4 - t3);
 
+        // Stage 5: Output
         const display_src = if (alpha < 1.0 and self.ema_initialized) self.ema_data[0..fft_size] else self.fft.fft_mag[0..fft_size];
         @memcpy(self.frame_display[0..fft_size], display_src);
         @memcpy(self.frame_peak[0..fft_size], self.peak_hold_data[0..fft_size]);
@@ -214,6 +237,12 @@ pub const SpectrumWorker = struct {
             .fft_size = fft_size,
         };
         self.output.publish(1);
+        const t5: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.output, t5 - t4);
+
+        self.timing_ema.updateTotal(t5 - t0);
+        self.timing_ema.finalize();
+        self.timing_ema.publish(&self.pipeline_stats);
     }
 
     pub fn reset(self: *Self) void {
@@ -236,6 +265,10 @@ pub const SpectrumAnalyzer = struct {
     peak_decay_rate: f32,
     dc_filter_enabled: bool,
     dsp_rate: i32,
+
+    dsp_frame_count: u32,
+    last_rate_time_ns: i128,
+    measured_dsp_rate: ?f32,
 
     cached_display: []f32,
     cached_peak: []f32,
@@ -299,6 +332,9 @@ pub const SpectrumAnalyzer = struct {
             .peak_decay_rate = 1.6,
             .dc_filter_enabled = false,
             .dsp_rate = 30,
+            .dsp_frame_count = 0,
+            .last_rate_time_ns = std.time.nanoTimestamp(),
+            .measured_dsp_rate = null,
             .cached_display = cached_display,
             .cached_peak = cached_peak,
             .has_frame = false,
@@ -339,6 +375,16 @@ pub const SpectrumAnalyzer = struct {
                 @memcpy(self.cached_peak[0..fft_size], frame.peak_hold);
                 self.waterfall.pushRow(frame.fft_mag_row);
                 self.has_frame = true;
+
+                self.dsp_frame_count += 1;
+                const now_ns = std.time.nanoTimestamp();
+                const elapsed_ns = now_ns - self.last_rate_time_ns;
+                if (elapsed_ns >= 500_000_000) {
+                    const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+                    self.measured_dsp_rate = @floatCast(@as(f64, @floatFromInt(self.dsp_frame_count)) / elapsed_s);
+                    self.dsp_frame_count = 0;
+                    self.last_rate_time_ns = now_ns;
+                }
 
                 const min_dist = SignalStats.minDistanceForWindow(self.window_index);
                 self.stats = SignalStats.compute(
@@ -418,6 +464,13 @@ pub const SpectrumAnalyzer = struct {
         @memset(self.cached_peak, -200.0);
         self.has_frame = false;
         self.waterfall.clear();
+        self.measured_dsp_rate = null;
+        self.dsp_frame_count = 0;
+        self.last_rate_time_ns = std.time.nanoTimestamp();
+    }
+
+    pub fn dspRate(self: *const Self) ?f32 {
+        return self.measured_dsp_rate;
     }
 
     pub fn displayData(self: *const Self) []const f32 {
@@ -449,7 +502,11 @@ pub const SpectrumAnalyzer = struct {
         zgui.setNextWindowPos(.{ .x = 360, .y = 10, .cond = .first_use_ever });
         zgui.setNextWindowSize(.{ .w = 340, .h = 400, .cond = .first_use_ever });
 
-        if (zgui.begin(zgui.formatZ("Analysis ({d:.0} fps)###Analysis", .{fps}), .{})) {
+        const title = if (self.measured_dsp_rate) |rate|
+            zgui.formatZ("Analysis ({d:.0} fps | {d:.0} Hz DSP)###Analysis", .{ fps, rate })
+        else
+            zgui.formatZ("Analysis ({d:.0} fps | -- Hz DSP)###Analysis", .{fps});
+        if (zgui.begin(title, .{})) {
             if (zgui.beginTabBar("analysis_tabs", .{})) {
                 defer zgui.endTabBar();
 
@@ -514,6 +571,11 @@ pub const SpectrumAnalyzer = struct {
                     defer zgui.endTabItem();
                     self.renderSignalInfo();
                 }
+
+                if (zgui.beginTabItem("Pipeline", .{})) {
+                    defer zgui.endTabItem();
+                    self.renderPipelineStats();
+                }
             }
         }
         zgui.end();
@@ -561,6 +623,60 @@ pub const SpectrumAnalyzer = struct {
                 _ = zgui.tableNextColumn();
                 zgui.text("{d:.1}", .{s.peaks[i].power_db});
             }
+        }
+    }
+
+    fn renderPipelineStats(self: *const Self) void {
+        if (!self.has_frame) {
+            zgui.text("No data", .{});
+            return;
+        }
+
+        const stats = &self.dsp_thread.worker.pipeline_stats;
+        const tstats = &self.dsp_thread.thread_stats;
+
+        zgui.separatorText("Stage Timing");
+        if (zgui.beginTable("pipeline_stages", .{
+            .column = 2,
+            .flags = .{ .borders = .{ .inner_h = true, .outer_h = true }, .row_bg = true, .sizing = .stretch_prop },
+        })) {
+            defer zgui.endTable();
+
+            zgui.tableSetupColumn("Stage", .{});
+            zgui.tableSetupColumn("Time", .{});
+            zgui.tableHeadersRow();
+
+            for (0..ps.stage_count) |i| {
+                zgui.tableNextRow(.{});
+                _ = zgui.tableNextColumn();
+                zgui.text("{s}", .{ps.stage_labels[i]});
+                _ = zgui.tableNextColumn();
+                const ns = stats.stage_ns[i].load(.acquire);
+                const us: f64 = @as(f64, @floatFromInt(ns)) / 1000.0;
+                zgui.text("{d:.1} us", .{us});
+            }
+
+            zgui.tableNextRow(.{});
+            _ = zgui.tableNextColumn();
+            zgui.textColored(.{ 1.0, 1.0, 0.4, 1.0 }, "Total", .{});
+            _ = zgui.tableNextColumn();
+            const total_ns = stats.total_ns.load(.acquire);
+            const total_us: f64 = @as(f64, @floatFromInt(total_ns)) / 1000.0;
+            zgui.textColored(.{ 1.0, 1.0, 0.4, 1.0 }, "{d:.1} us", .{total_us});
+        }
+
+        zgui.separatorText("Thread");
+        const busy_raw = tstats.busy_pct.load(.acquire);
+        const busy: f64 = @as(f64, @floatFromInt(busy_raw)) / 100.0;
+        zgui.text("Utilization: {d:.2}%%", .{busy});
+
+        const iterations = tstats.iteration_count.load(.acquire);
+        zgui.text("Iterations:  {d}", .{iterations});
+
+        if (self.measured_dsp_rate) |rate| {
+            zgui.text("DSP Rate:    {d:.1} Hz", .{rate});
+        } else {
+            zgui.text("DSP Rate:    --", .{});
         }
     }
 

@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const DoubleBuffer = @import("double_buffer.zig").DoubleBuffer;
 const FixedSizeRingBuffer = @import("../ring_buffer.zig").FixedSizeRingBuffer;
+const pipeline_stats = @import("pipeline_stats.zig");
+pub const ThreadStats = pipeline_stats.ThreadStats;
 
 pub fn ProcessorWorker(comptime P: type) type {
     return struct {
@@ -12,6 +14,8 @@ pub fn ProcessorWorker(comptime P: type) type {
         processor: P,
         output: DoubleBuffer(P.Output),
         work_buf: []P.Output,
+        process_time_ns: u64 = 0,
+        output_time_ns: u64 = 0,
 
         pub fn init(alloc: Allocator, capacity: usize, processor: P) !Self {
             var output = try DoubleBuffer(P.Output).init(alloc, capacity);
@@ -30,10 +34,15 @@ pub fn ProcessorWorker(comptime P: type) type {
         }
 
         pub fn work(self: *Self, input: []const Input) void {
+            const t0: u64 = @intCast(std.time.nanoTimestamp());
             const n = self.processor.process(input, self.work_buf);
+            const t1: u64 = @intCast(std.time.nanoTimestamp());
             const out = self.output.writeSlice();
             @memcpy(out[0..n], self.work_buf[0..n]);
             self.output.publish(n);
+            const t2: u64 = @intCast(std.time.nanoTimestamp());
+            self.process_time_ns = t1 - t0;
+            self.output_time_ns = t2 - t1;
         }
 
         pub fn reset(self: *Self) void {
@@ -57,6 +66,7 @@ pub fn DspThread(comptime Worker: type) type {
         chunk_size: usize,
         input_buf: []Worker.Input,
         alloc: Allocator,
+        thread_stats: ThreadStats = .{},
 
         pub fn init(alloc: Allocator, chunk_size: usize, worker: Worker) !Self {
             return .{
@@ -97,7 +107,13 @@ pub fn DspThread(comptime Worker: type) type {
 
         fn runLoop(self: *Self, mutex: *std.Thread.Mutex, rx_buffer: *FixedSizeRingBuffer(Worker.Input)) void {
             var last_work_ns: i128 = std.time.nanoTimestamp();
+            var busy_ema: f64 = 0.0;
+            var busy_initialized = false;
+            const busy_alpha = 0.05;
+
             while (self.running.load(.acquire)) {
+                const loop_start: u64 = @intCast(std.time.nanoTimestamp());
+
                 mutex.lock();
                 const copied = rx_buffer.copyNewest(self.input_buf);
                 mutex.unlock();
@@ -107,7 +123,11 @@ pub fn DspThread(comptime Worker: type) type {
                     continue;
                 }
 
+                const work_start: u64 = @intCast(std.time.nanoTimestamp());
                 self.worker.work(self.input_buf[0..copied]);
+                const work_end: u64 = @intCast(std.time.nanoTimestamp());
+
+                _ = self.thread_stats.iteration_count.fetchAdd(1, .monotonic);
 
                 const target_ns = self.target_interval_ns.load(.acquire);
                 if (target_ns > 0) {
@@ -117,6 +137,20 @@ pub fn DspThread(comptime Worker: type) type {
                         std.Thread.sleep(@intCast(target_ns - @as(u64, @intCast(elapsed))));
                     }
                     last_work_ns = std.time.nanoTimestamp();
+                }
+
+                const loop_end: u64 = @intCast(std.time.nanoTimestamp());
+                const work_dur = work_end - work_start;
+                const loop_dur = loop_end - loop_start;
+                if (loop_dur > 0) {
+                    const ratio = @as(f64, @floatFromInt(work_dur)) / @as(f64, @floatFromInt(loop_dur));
+                    if (!busy_initialized) {
+                        busy_ema = ratio;
+                        busy_initialized = true;
+                    } else {
+                        busy_ema = busy_alpha * ratio + (1.0 - busy_alpha) * busy_ema;
+                    }
+                    self.thread_stats.busy_pct.store(@intFromFloat(busy_ema * 10000.0), .release);
                 }
             }
         }

@@ -15,6 +15,8 @@ pub fn Chain(comptime A: type, comptime B: type) type {
         a: A,
         b: B,
         mid_buf: []A.Output,
+        a_time_ns: u64 = 0,
+        b_time_ns: u64 = 0,
 
         pub fn init(alloc: Allocator, chunk_size: usize, a: A, b: B) !Self {
             return .{
@@ -29,8 +31,14 @@ pub fn Chain(comptime A: type, comptime B: type) type {
         }
 
         pub fn process(self: *Self, input: []const Input, output: []Output) usize {
+            const t0: u64 = @intCast(std.time.nanoTimestamp());
             const mid_n = self.a.process(input, self.mid_buf);
-            return self.b.process(self.mid_buf[0..mid_n], output);
+            const t1: u64 = @intCast(std.time.nanoTimestamp());
+            const n = self.b.process(self.mid_buf[0..mid_n], output);
+            const t2: u64 = @intCast(std.time.nanoTimestamp());
+            self.a_time_ns = t1 - t0;
+            self.b_time_ns = t2 - t1;
+            return n;
         }
 
         pub fn reset(self: *Self) void {

@@ -65,9 +65,15 @@ const SDR = struct {
     }
 
     pub fn deinit(self: *Self, alloc: std.mem.Allocator) !void {
+        self.rx_running = false;
+
+        var timeout: u32 = 0;
+        while (self.device.isStreaming() and timeout < 100) : (timeout += 1) {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+
         self.rx_buffer.deinit(alloc);
         self.device.close();
-
         try hackrf.deinit();
     }
 };
@@ -202,6 +208,7 @@ const WaterfallGpu = struct {
 };
 
 fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
+    zgui.dockBuilderRemoveNode(dockspace_id);
     _ = zgui.dockBuilderAddNode(dockspace_id, .{ .dock_space = true });
     const vp = zgui.getMainViewport();
     const vp_size = vp.getSize();
@@ -215,9 +222,9 @@ fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
     var bottom_id: zgui.Ident = undefined;
     _ = zgui.dockBuilderSplitNode(right_id, .up, 0.25, &top_id, &bottom_id);
 
-    zgui.dockBuilderDockWindow("HackRF Config", left_id);
+    zgui.dockBuilderDockWindow("###HackRF Config", left_id);
     zgui.dockBuilderDockWindow("###Analysis", top_id);
-    zgui.dockBuilderDockWindow("Data View", bottom_id);
+    zgui.dockBuilderDockWindow("###Data View", bottom_id);
     zgui.dockBuilderFinish(dockspace_id);
 }
 
@@ -232,7 +239,7 @@ pub fn main() !void {
     try zsdl.init(.{ .video = true, .events = true });
     defer zsdl.quit();
 
-    const window = try zsdl.createWindow("rf-fun", 1920, 1080, .{ .resizable = true, .high_pixel_density = true });
+    const window = try zsdl.createWindow("rf-fun", 800, 600, .{ .resizable = true, .high_pixel_density = true, .maximized = true });
     defer zsdl.destroyWindow(window);
 
     const gpu_device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_METALLIB | c.SDL_GPU_SHADERFORMAT_SPIRV, true, null) orelse {
@@ -251,6 +258,7 @@ pub fn main() !void {
     zgui.init(alloc);
     defer zgui.deinit();
 
+    zgui.io.setIniFilename(null);
     zgui.io.setConfigFlags(.{.dock_enable = true});
 
     zgui.plot.init();
@@ -276,7 +284,7 @@ pub fn main() !void {
     defer wf_gpu.deinit();
 
     var last_retune_time_ms: u64 = 0;
-    var dock_initialized = false;
+    var dock_init_frames: u32 = 0;
 
     var running = true;
     while (running) {
@@ -324,9 +332,9 @@ pub fn main() !void {
             zgui.backend.newFrame(sw_w, sw_h, fb_scale);
 
             const dockspace_id: zgui.Ident = 0xB00B1E5;
-            if (!dock_initialized) {
-                dock_initialized = true;
-                if (zgui.dockBuilderGetNode(dockspace_id) == null) {
+            if (dock_init_frames < 3) {
+                dock_init_frames += 1;
+                if (dock_init_frames == 3) {
                     buildDefaultDockLayout(dockspace_id);
                 }
             }
@@ -334,12 +342,11 @@ pub fn main() !void {
 
             if (config.reset_layout_requested) {
                 config.reset_layout_requested = false;
-                zgui.dockBuilderRemoveNode(dockspace_id);
                 buildDefaultDockLayout(dockspace_id);
             }
 
             {
-                config.render(if (sdr != null) sdr.?.device else null);
+                config.render(if (sdr != null) sdr.?.device else null, analyzer.dspRate());
 
                 if (config.connect_requested) {
                     config.connect_requested = false;
@@ -389,7 +396,11 @@ pub fn main() !void {
                     }
                 }
 
-                if (zgui.begin("Data View", .{})) {
+                const dv_title = if (analyzer.dspRate()) |rate|
+                    zgui.formatZ("Data View ({d:.0} Hz DSP)###Data View", .{rate})
+                else
+                    zgui.formatZ("Data View (-- Hz DSP)###Data View", .{});
+                if (zgui.begin(dv_title, .{})) {
                     const avail = zgui.getContentRegionAvail();
                     const line_h = avail[1] * 0.35;
                     const wf_h = avail[1] * 0.60;

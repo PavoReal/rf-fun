@@ -2,3 +2,4 @@
 zig-out/
 deps/
 .claude/
+imgui.ini

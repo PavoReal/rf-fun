@@ -7,6 +7,8 @@ pub const PeakInfo = struct {
     freq_mhz: f32 = 0,
     power_db: f32 = -200,
     bin: u32 = 0,
+    delta_db: f32 = 0,
+    snr_db: f32 = 0,
 };
 
 pub const SignalStats = struct {
@@ -35,7 +37,12 @@ pub const SignalStats = struct {
             stats.peak_freq_mhz = stats.peaks[0].freq_mhz;
             stats.peak_power_db = stats.peaks[0].power_db;
             stats.sfdr_db = computeSfdr(&stats.peaks, stats.num_peaks);
-            stats.snr_db = computeSnr(spectrum_db, stats.peaks[0].bin, min_distance, stats.peak_power_db);
+
+            for (0..stats.num_peaks) |i| {
+                stats.peaks[i].delta_db = stats.peaks[i].power_db - stats.peaks[0].power_db;
+                stats.peaks[i].snr_db = computeSnr(spectrum_db, stats.peaks[i].bin, min_distance, stats.peaks[i].power_db);
+            }
+            stats.snr_db = stats.peaks[0].snr_db;
         }
 
         return stats;

@@ -12,6 +12,14 @@ pub const PlotSeries = struct {
     line_weight: f32 = -1.0,
 };
 
+pub const PlotMarker = struct {
+    x_data: []const f32,
+    y_data: []const f32,
+    label: [:0]const u8 = "Peaks",
+    color: [4]f32 = .{ 1.0, 1.0, 0.0, 1.0 },
+    size: f32 = 6.0,
+};
+
 pub const PlotLimits = struct { x_min: f64, x_max: f64 };
 
 pub const RenderResult = struct {
@@ -26,6 +34,7 @@ pub fn render(
     x_label: [:0]const u8,
     y_label: [:0]const u8,
     series: []const PlotSeries,
+    markers: []const PlotMarker,
     y_range: [2]f64,
     x_range: ?[2]f64,
     refit_x: bool,
@@ -83,6 +92,20 @@ pub fn render(
             }
             if (s.color != null) {
                 zgui.plot.popStyleColor(.{});
+            }
+        }
+
+        for (markers) |m| {
+            zgui.plot.pushStyleColor4f(.{ .idx = .line, .c = m.color });
+            zgui.plot.pushStyleVar1i(.{ .idx = .marker, .v = @intFromEnum(zgui.plot.Marker.circle) });
+            zgui.plot.pushStyleVar1f(.{ .idx = .marker_size, .v = m.size });
+            zgui.plot.plotScatter(m.label, f32, .{ .xv = m.x_data, .yv = m.y_data });
+            zgui.plot.popStyleVar(.{ .count = 2 });
+            zgui.plot.popStyleColor(.{});
+
+            for (m.x_data, m.y_data, 0..) |x, y, i| {
+                const txt = zgui.formatZ("{d}", .{i + 1});
+                zgui.plot.plotText(txt, .{ .x = @floatCast(x), .y = @floatCast(y), .pix_offset = .{ 8, -8 } });
             }
         }
 

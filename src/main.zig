@@ -6,6 +6,7 @@ const Waterfall = @import("waterfall.zig").Waterfall;
 const util = @import("util.zig");
 const HackRFConfig = @import("hackrf_config.zig").HackRFConfig;
 const SpectrumAnalyzer = @import("spectrum_analyzer.zig").SpectrumAnalyzer;
+const signal_stats = @import("signal_stats.zig");
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -430,11 +431,30 @@ pub fn main() !void {
                         series_count += 1;
                     }
 
+                    var peak_x: [signal_stats.MAX_PEAKS]f32 = undefined;
+                    var peak_y: [signal_stats.MAX_PEAKS]f32 = undefined;
+                    const num_peaks = @min(analyzer.stats.num_peaks, analyzer.num_display_peaks);
+                    for (0..num_peaks) |i| {
+                        peak_x[i] = analyzer.stats.peaks[i].freq_mhz;
+                        peak_y[i] = analyzer.stats.peaks[i].power_db;
+                    }
+
+                    var markers_buf: [1]plot.PlotMarker = undefined;
+                    var marker_count: usize = 0;
+                    if (num_peaks > 0) {
+                        markers_buf[0] = .{
+                            .x_data = peak_x[0..num_peaks],
+                            .y_data = peak_y[0..num_peaks],
+                        };
+                        marker_count = 1;
+                    }
+
                     const plot_result = plot.render(
                         "FFT",
                         "Freq (MHz)",
                         "dB",
                         series_buf[0..series_count],
+                        markers_buf[0..marker_count],
                         .{ -120.0, 0.0 },
                         analyzer.xRange(),
                         analyzer.refit_x,

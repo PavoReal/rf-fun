@@ -283,6 +283,7 @@ pub const SpectrumAnalyzer = struct {
 
     stats: SignalStats,
     stats_scratch: []f32,
+    num_display_peaks: usize = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -584,7 +585,7 @@ pub const SpectrumAnalyzer = struct {
         zgui.end();
     }
 
-    fn renderSignalInfo(self: *const Self) void {
+    fn renderSignalInfo(self: *Self) void {
         if (!self.has_frame) {
             zgui.text("No data", .{});
             return;
@@ -593,19 +594,36 @@ pub const SpectrumAnalyzer = struct {
         const s = self.stats;
 
         zgui.separatorText("Overview");
-        zgui.text("Peak:        {d:.3} MHz  @ {d:.1} dB", .{ s.peak_freq_mhz, s.peak_power_db });
         zgui.text("Noise Floor: {d:.1} dB", .{s.noise_floor_db});
-        zgui.text("SFDR:        {d:.1} dB", .{s.sfdr_db});
         zgui.text("SNR:         {d:.1} dB", .{s.snr_db});
 
         zgui.separatorText("Top Peaks");
-        if (s.num_peaks == 0) {
+
+        if (zgui.smallButton("-")) {
+            self.num_display_peaks -|= 1;
+        }
+        zgui.sameLine(.{});
+        zgui.text("{d} Peaks", .{self.num_display_peaks});
+        zgui.sameLine(.{});
+        if (zgui.smallButton("+")) {
+            if (self.num_display_peaks < MAX_PEAKS) {
+                self.num_display_peaks += 1;
+            }
+        }
+
+        if (self.num_display_peaks == 0) {
+            zgui.text("No peak markers", .{});
+            return;
+        }
+
+        const display_count = @min(self.num_display_peaks, s.num_peaks);
+        if (display_count == 0) {
             zgui.text("No peaks detected", .{});
             return;
         }
 
         if (zgui.beginTable("peaks_table", .{
-            .column = 3,
+            .column = 5,
             .flags = .{ .borders = .{ .inner_h = true, .outer_h = true }, .row_bg = true, .sizing = .stretch_prop },
         })) {
             defer zgui.endTable();
@@ -613,9 +631,11 @@ pub const SpectrumAnalyzer = struct {
             zgui.tableSetupColumn("#", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 24 });
             zgui.tableSetupColumn("Freq (MHz)", .{});
             zgui.tableSetupColumn("Power (dB)", .{});
+            zgui.tableSetupColumn("Delta (dB)", .{});
+            zgui.tableSetupColumn("SNR (dB)", .{});
             zgui.tableHeadersRow();
 
-            for (0..s.num_peaks) |i| {
+            for (0..display_count) |i| {
                 zgui.tableNextRow(.{});
                 _ = zgui.tableNextColumn();
                 zgui.text("{d}", .{i + 1});
@@ -623,6 +643,10 @@ pub const SpectrumAnalyzer = struct {
                 zgui.text("{d:.3}", .{s.peaks[i].freq_mhz});
                 _ = zgui.tableNextColumn();
                 zgui.text("{d:.1}", .{s.peaks[i].power_db});
+                _ = zgui.tableNextColumn();
+                zgui.text("{d:.1}", .{s.peaks[i].delta_db});
+                _ = zgui.tableNextColumn();
+                zgui.text("{d:.1}", .{s.peaks[i].snr_db});
             }
         }
     }

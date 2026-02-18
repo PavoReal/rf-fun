@@ -113,15 +113,11 @@ pub const HackRFConfig = struct {
         device.setRxOverrunLimit(@intCast(self.rx_overrun_limit)) catch {};
     }
 
-    pub fn render(self: *HackRFConfig, device: ?hackrf.Device, dsp_rate: ?f32) void {
+    pub fn render(self: *HackRFConfig, device: ?hackrf.Device) void {
         zgui.setNextWindowPos(.{ .x = 10, .y = 10, .cond = .first_use_ever });
         zgui.setNextWindowSize(.{ .w = 340, .h = 650, .cond = .first_use_ever });
 
-        const title = if (dsp_rate) |rate|
-            zgui.formatZ("HackRF Config ({d:.0} Hz DSP)###HackRF Config", .{rate})
-        else
-            zgui.formatZ("HackRF Config (-- Hz DSP)###HackRF Config", .{});
-        if (!zgui.begin(title, .{})) {
+        if (!zgui.begin("HackRF Config###HackRF Config", .{})) {
             zgui.end();
             return;
         }

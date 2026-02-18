@@ -222,8 +222,13 @@ fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
     var bottom_id: zgui.Ident = undefined;
     _ = zgui.dockBuilderSplitNode(right_id, .up, 0.25, &top_id, &bottom_id);
 
+    var analysis_id: zgui.Ident = undefined;
+    var stats_id: zgui.Ident = undefined;
+    _ = zgui.dockBuilderSplitNode(top_id, .left, 0.6, &analysis_id, &stats_id);
+
     zgui.dockBuilderDockWindow("###HackRF Config", left_id);
-    zgui.dockBuilderDockWindow("###Analysis", top_id);
+    zgui.dockBuilderDockWindow("###Analysis", analysis_id);
+    zgui.dockBuilderDockWindow("###Stats", stats_id);
     zgui.dockBuilderDockWindow("###Data View", bottom_id);
     zgui.dockBuilderFinish(dockspace_id);
 }
@@ -346,7 +351,7 @@ pub fn main() !void {
             }
 
             {
-                config.render(if (sdr != null) sdr.?.device else null, analyzer.dspRate());
+                config.render(if (sdr != null) sdr.?.device else null);
 
                 if (config.connect_requested) {
                     config.connect_requested = false;
@@ -396,11 +401,7 @@ pub fn main() !void {
                     }
                 }
 
-                const dv_title = if (analyzer.dspRate()) |rate|
-                    zgui.formatZ("Data View ({d:.0} Hz DSP)###Data View", .{rate})
-                else
-                    zgui.formatZ("Data View (-- Hz DSP)###Data View", .{});
-                if (zgui.begin(dv_title, .{})) {
+                if (zgui.begin("Data View###Data View", .{})) {
                     const avail = zgui.getContentRegionAvail();
                     const line_h = avail[1] * 0.35;
                     const wf_h = avail[1] * 0.60;

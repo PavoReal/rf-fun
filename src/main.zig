@@ -261,6 +261,7 @@ pub fn main() !void {
     const alloc = allocator.allocator();
 
     var sdr: ?SDR = null;
+    var show_no_device_popup: bool = false;
 
     try zsdl.init(.{ .video = true, .events = true, .audio = true });
     defer zsdl.quit();
@@ -284,7 +285,10 @@ pub fn main() !void {
     zgui.init(alloc);
     defer zgui.deinit();
 
-    //zgui.io.setIniFilename(null);
+    const has_saved_layout = blk: {
+        std.fs.cwd().access("imgui.ini", .{}) catch break :blk false;
+        break :blk true;
+    };
     zgui.io.setConfigFlags(.{ .dock_enable = true });
 
     zgui.plot.init();
@@ -367,7 +371,7 @@ pub fn main() !void {
             const dockspace_id: zgui.Ident = 0xB00B1E5;
             if (dock_init_frames < 3) {
                 dock_init_frames += 1;
-                if (dock_init_frames == 3) {
+                if (dock_init_frames == 3 and !has_saved_layout) {
                     buildDefaultDockLayout(dockspace_id);
                 }
             }
@@ -398,6 +402,13 @@ pub fn main() !void {
                         break :blk null;
                     };
 
+                    if (sdr == null) {
+                        show_no_device_popup = true;
+                        zgui.openPopup("No Device", .{});
+                    } else {
+                        show_no_device_popup = false;
+                    }
+
                     if (sdr != null) {
                         config.readDeviceInfo(sdr.?.device);
                         config.applyAll(sdr.?.device);
@@ -406,6 +417,30 @@ pub fn main() !void {
                         try sdr.?.startRx();
                         try analyzer.startThread(&sdr.?.mutex, &sdr.?.rx_buffer);
                         try radio_decoder.start(&sdr.?.mutex, &sdr.?.rx_buffer);
+                    }
+                }
+
+                if (show_no_device_popup) {
+                    const vp = zgui.getMainViewport();
+                    const vp_size = vp.getSize();
+                    zgui.setNextWindowPos(.{ .x = vp_size[0] / 2.0 - 150.0, .y = vp_size[1] / 2.0 - 60.0 });
+                    zgui.setNextWindowSize(.{ .w = 300, .h = 120 });
+
+                    if (zgui.beginPopupModal("No Device", .{ .flags = .{ .no_resize = true, .no_move = true } })) {
+                        zgui.text("No HackRF device detected.", .{});
+                        zgui.spacing();
+                        zgui.separator();
+                        zgui.spacing();
+
+                        if (zgui.button("Scan for device", .{})) {
+                            config.connect_requested = true;
+                            zgui.closeCurrentPopup();
+                        }
+                        zgui.sameLine(.{});
+                        if (zgui.button("Exit", .{})) {
+                            running = false;
+                        }
+                        zgui.endPopup();
                     }
                 }
 
@@ -434,6 +469,27 @@ pub fn main() !void {
                     analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                     radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
                     drag_freq = radio_decoder.ui_freq_mhz;
+                }
+
+                {
+                    const retune_raw = radio_decoder.retune_center_requested.swap(0, .acquire);
+                    if (retune_raw != 0) {
+                        const desired_freq: f64 = @bitCast(retune_raw);
+                        if (sdr != null) {
+                            const cf_offset_mhz = config.fsHz() / 4e6;
+                            const new_cf_mhz = desired_freq - cf_offset_mhz;
+                            const new_cf_hz: u64 = @intFromFloat(@max(0.0, new_cf_mhz * 1e6));
+                            if (new_cf_hz > 0) {
+                                sdr.?.device.setFreq(new_cf_hz) catch {};
+                                config.cf_mhz = @floatCast(new_cf_mhz);
+                                analyzer.updateFreqs(config.cf_mhz, config.fsHz());
+                                analyzer.resetSmoothing();
+                                radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
+                                radio_decoder.setFreqMhz(desired_freq);
+                                drag_freq = radio_decoder.ui_freq_mhz;
+                            }
+                        }
+                    }
                 }
 
                 if (config.rx_buf_size_changed) {

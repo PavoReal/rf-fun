@@ -454,6 +454,7 @@ pub const RadioDecoder = struct {
     squelch_threshold: std.atomic.Value(u32) = .init(0),
 
     reconfigure_flag: std.atomic.Value(bool) = .init(false),
+    retune_center_requested: std.atomic.Value(u64) = .init(0),
 
     thread_stats: ps.ThreadStats = .{},
     measured_dsp_rate: std.atomic.Value(u32) = .init(0),
@@ -675,10 +676,18 @@ pub const RadioDecoder = struct {
     pub fn setFreqMhz(self: *Self, freq_mhz: f64) void {
         const half_bw = self.sample_rate / 2e6;
         const cf: f64 = @floatCast(self.center_freq_mhz);
-        const clamped = std.math.clamp(freq_mhz, cf - half_bw, cf + half_bw);
-        self.freq_mhz.store(@bitCast(clamped), .release);
-        self.ui_freq_mhz = clamped;
-        _ = std.fmt.bufPrint(&self.ui_freq_text, "{d:.3}\x00", .{clamped}) catch {};
+        const lo = cf - half_bw;
+        const hi = cf + half_bw;
+
+        if (freq_mhz >= lo and freq_mhz <= hi) {
+            self.freq_mhz.store(@bitCast(freq_mhz), .release);
+            self.ui_freq_mhz = freq_mhz;
+            _ = std.fmt.bufPrint(&self.ui_freq_text, "{d:.3}\x00", .{freq_mhz}) catch {};
+        } else {
+            self.ui_freq_mhz = freq_mhz;
+            _ = std.fmt.bufPrint(&self.ui_freq_text, "{d:.3}\x00", .{freq_mhz}) catch {};
+            self.retune_center_requested.store(@bitCast(freq_mhz), .release);
+        }
     }
 
     pub fn pipelineView(self: *const Self) ps.PipelineView {

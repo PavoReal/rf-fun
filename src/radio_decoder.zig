@@ -5,6 +5,7 @@ const DecimatingFir = @import("dsp/decimating_fir.zig").DecimatingFir;
 const Nco = @import("dsp/nco.zig").Nco;
 const DeEmphasis = @import("dsp/deemphasis.zig").DeEmphasis;
 const DcFilter = @import("dsp/dc_filter.zig").DcFilter;
+const CtcssDetector = @import("dsp/ctcss_detector.zig").CtcssDetector;
 const ps = @import("dsp/pipeline_stats.zig");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -14,11 +15,13 @@ const c = @cImport({
 pub const ModulationType = enum(u8) {
     fm = 0,
     am = 1,
+    nfm = 2,
 
     pub fn intermediateRate(self: ModulationType) f32 {
         return switch (self) {
             .fm => 400_000.0,
             .am => 32_000.0,
+            .nfm => 50_000.0,
         };
     }
 
@@ -26,6 +29,7 @@ pub const ModulationType = enum(u8) {
         return switch (self) {
             .fm => 50_000.0,
             .am => 16_000.0,
+            .nfm => 25_000.0,
         };
     }
 
@@ -33,11 +37,20 @@ pub const ModulationType = enum(u8) {
         return switch (self) {
             .fm => 8,
             .am => 2,
+            .nfm => 2,
         };
     }
 
     pub fn bandwidthMhz(self: ModulationType) f64 {
         return self.intermediateRate() / 1e6;
+    }
+
+    pub fn defaultTau(self: ModulationType) f32 {
+        return switch (self) {
+            .fm => 75e-6,
+            .am => 0.0,
+            .nfm => 750e-6,
+        };
     }
 };
 
@@ -47,7 +60,9 @@ pub const RadioStageId = enum(u3) {
     demodulate = 2,
     stage2_decimate = 3,
     deemphasis = 4,
-    audio_output = 5,
+    squelch = 5,
+    ctcss_detect = 6,
+    audio_output = 7,
 };
 
 pub const radio_stage_labels: [std.enums.values(RadioStageId).len][:0]const u8 = .{
@@ -56,6 +71,8 @@ pub const radio_stage_labels: [std.enums.values(RadioStageId).len][:0]const u8 =
     "Demodulate",
     "Stage 2 Decimate",
     "De-emphasis",
+    "Squelch",
+    "CTCSS Detect",
     "Audio Output",
 };
 
@@ -83,10 +100,17 @@ pub const DecoderWorker = struct {
     stage1_capacity: usize,
     stage2_capacity: usize,
 
+    ctcss: ?CtcssDetector,
+    squelch_threshold: f32,
+    squelch_open: bool,
+
     volume: f32,
     audio_stream: ?*c.SDL_AudioStream,
 
     peak_level: std.atomic.Value(u32) = .init(0),
+    ctcss_tone_index: std.atomic.Value(i8) = .init(-1),
+    squelch_open_atomic: std.atomic.Value(u8) = .init(0),
+    audio_rms: std.atomic.Value(u32) = .init(0),
 
     timing_ema: ps.EmaAccumulator(RadioStageId) = ps.EmaAccumulator(RadioStageId).init(0.1),
     pipeline_stats: ps.PipelineStats(RadioStageId) = .{},
@@ -105,6 +129,7 @@ pub const DecoderWorker = struct {
         const stage1_cutoff: f32 = switch (modulation) {
             .fm => intermediate_rate * 0.45,
             .am => 5000.0,
+            .nfm => 6250.0,
         };
 
         var stage1_fir = try DecimatingFir([2]f32).init(alloc, computeTapCount(stage1_r), stage1_cutoff, sr, stage1_r);
@@ -145,6 +170,9 @@ pub const DecoderWorker = struct {
             .input_capacity = input_cap,
             .stage1_capacity = stage1_cap,
             .stage2_capacity = stage2_cap,
+            .ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null,
+            .squelch_threshold = 0.0,
+            .squelch_open = true,
             .volume = 0.5,
             .audio_stream = null,
         };
@@ -166,10 +194,7 @@ pub const DecoderWorker = struct {
         const len = @min(input.len, self.input_capacity);
 
         const t0: u64 = @intCast(std.time.nanoTimestamp());
-        for (input[0..len], self.nco_buf[0..len]) |sample, *out| {
-            out.* = sample.toFloat();
-        }
-        _ = self.nco.process(self.nco_buf[0..len], self.nco_buf[0..len]);
+        _ = self.nco.processIQ(input[0..len], self.nco_buf[0..len]);
         const t1: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.nco_mix, t1 - t0);
 
@@ -179,7 +204,7 @@ pub const DecoderWorker = struct {
         self.timing_ema.update(.stage1_decimate, t2 - t1);
 
         switch (self.modulation) {
-            .fm => self.discriminate(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]),
+            .fm, .nfm => self.discriminate(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]),
             .am => {
                 self.envelopeDetect(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]);
                 _ = self.dc_block.process(self.discrim_buf[0..s1_count], self.discrim_buf[0..s1_count]);
@@ -194,11 +219,39 @@ pub const DecoderWorker = struct {
         self.timing_ema.update(.stage2_decimate, t4 - t3);
 
         switch (self.modulation) {
-            .fm => _ = self.deemphasis.process(self.stage2_buf[0..s2_count], self.audio_buf[0..s2_count]),
+            .fm, .nfm => _ = self.deemphasis.process(self.stage2_buf[0..s2_count], self.audio_buf[0..s2_count]),
             .am => @memcpy(self.audio_buf[0..s2_count], self.stage2_buf[0..s2_count]),
         }
         const t5: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.deemphasis, t5 - t4);
+
+        if (self.ctcss) |*ctcss| {
+            if (ctcss.process(self.audio_buf[0..s2_count])) {
+                self.ctcss_tone_index.store(ctcss.detected_tone_index, .release);
+            }
+        }
+        const t5b: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.ctcss_detect, t5b - t5);
+
+        var rms_acc: f64 = 0.0;
+        for (self.audio_buf[0..s2_count]) |s| {
+            rms_acc += @as(f64, s) * @as(f64, s);
+        }
+        const rms: f32 = @floatCast(@sqrt(rms_acc / @as(f64, @floatFromInt(s2_count))));
+        self.audio_rms.store(@bitCast(rms), .release);
+
+        if (self.modulation == .nfm and self.squelch_threshold > 0.0) {
+            self.squelch_open = rms > self.squelch_threshold;
+            self.squelch_open_atomic.store(if (self.squelch_open) 1 else 0, .release);
+            if (!self.squelch_open) {
+                @memset(self.audio_buf[0..s2_count], 0.0);
+            }
+        } else {
+            self.squelch_open = true;
+            self.squelch_open_atomic.store(1, .release);
+        }
+        const t5c: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.squelch, t5c - t5b);
 
         var peak: f32 = 0.0;
         for (self.audio_buf[0..s2_count]) |*s| {
@@ -215,21 +268,102 @@ pub const DecoderWorker = struct {
             );
         }
         const t6: u64 = @intCast(std.time.nanoTimestamp());
-        self.timing_ema.update(.audio_output, t6 - t5);
+        self.timing_ema.update(.audio_output, t6 - t5c);
 
         self.timing_ema.updateTotal(t6 - t0);
         self.timing_ema.finalize();
         self.timing_ema.publish(&self.pipeline_stats);
     }
 
+    fn fastAtan2(y: f32, x: f32) f32 {
+        const abs_x = @abs(x);
+        const abs_y = @abs(y);
+        const max_val = @max(abs_x, abs_y);
+        const min_val = @min(abs_x, abs_y);
+        const z = min_val / (max_val + 1e-10);
+        const z2 = z * z;
+        var result = (0.97239411 + (-0.19194795) * z2) * z;
+        if (abs_y > abs_x) result = std.math.pi / 2.0 - result;
+        if (x < 0.0) result = std.math.pi - result;
+        if (y < 0.0) result = -result;
+        return result;
+    }
+
+    fn fastAtan2Simd(y: @Vector(8, f32), x: @Vector(8, f32)) @Vector(8, f32) {
+        const abs_x = @abs(x);
+        const abs_y = @abs(y);
+        const max_val = @max(abs_x, abs_y);
+        const min_val = @min(abs_x, abs_y);
+        const epsilon: @Vector(8, f32) = @splat(1e-10);
+        const z = min_val / (max_val + epsilon);
+        const z2 = z * z;
+        const c1: @Vector(8, f32) = @splat(0.97239411);
+        const c2: @Vector(8, f32) = @splat(-0.19194795);
+        const half_pi: @Vector(8, f32) = @splat(std.math.pi / 2.0);
+        const pi: @Vector(8, f32) = @splat(std.math.pi);
+        const zero: @Vector(8, f32) = @splat(0.0);
+        var result = (c1 + c2 * z2) * z;
+        const swap_mask = abs_y > abs_x;
+        result = @select(f32, swap_mask, half_pi - result, result);
+        const x_neg = x < zero;
+        result = @select(f32, x_neg, pi - result, result);
+        const y_neg = y < zero;
+        result = @select(f32, y_neg, -result, result);
+        return result;
+    }
+
     fn discriminate(self: *Self, input: []const [2]f32, output: []f32) void {
-        for (input, output) |sample, *out| {
-            const conj_prev = [2]f32{ self.prev_sample[0], -self.prev_sample[1] };
-            const prod_i = sample[0] * conj_prev[0] - sample[1] * conj_prev[1];
-            const prod_q = sample[0] * conj_prev[1] + sample[1] * conj_prev[0];
-            out.* = std.math.atan2(prod_q, prod_i);
-            self.prev_sample = sample;
+        if (input.len == 0) return;
+
+        {
+            const sample = input[0];
+            const prod_i = sample[0] * self.prev_sample[0] + sample[1] * self.prev_sample[1];
+            const prod_q = sample[1] * self.prev_sample[0] - sample[0] * self.prev_sample[1];
+            output[0] = fastAtan2(prod_q, prod_i);
         }
+
+        const vec_len = 8;
+        var i: usize = 1;
+        const simd_end = if (input.len > vec_len) input.len - (input.len - 1) % vec_len else 1;
+
+        while (i < simd_end) : (i += vec_len) {
+            var cur_i_arr: [vec_len]f32 = undefined;
+            var cur_q_arr: [vec_len]f32 = undefined;
+            var prev_i_arr: [vec_len]f32 = undefined;
+            var prev_q_arr: [vec_len]f32 = undefined;
+
+            for (0..vec_len) |j| {
+                cur_i_arr[j] = input[i + j][0];
+                cur_q_arr[j] = input[i + j][1];
+                prev_i_arr[j] = input[i + j - 1][0];
+                prev_q_arr[j] = input[i + j - 1][1];
+            }
+
+            const cur_i: @Vector(vec_len, f32) = cur_i_arr;
+            const cur_q: @Vector(vec_len, f32) = cur_q_arr;
+            const prev_i: @Vector(vec_len, f32) = prev_i_arr;
+            const prev_q: @Vector(vec_len, f32) = prev_q_arr;
+
+            const prod_i = cur_i * prev_i + cur_q * prev_q;
+            const prod_q = cur_q * prev_i - cur_i * prev_q;
+
+            const result = fastAtan2Simd(prod_q, prod_i);
+            const result_arr: [vec_len]f32 = result;
+
+            for (0..vec_len) |j| {
+                output[i + j] = result_arr[j];
+            }
+        }
+
+        while (i < input.len) : (i += 1) {
+            const sample = input[i];
+            const prev = input[i - 1];
+            const prod_i = sample[0] * prev[0] + sample[1] * prev[1];
+            const prod_q = sample[1] * prev[0] - sample[0] * prev[1];
+            output[i] = fastAtan2(prod_q, prod_i);
+        }
+
+        self.prev_sample = input[input.len - 1];
     }
 
     fn envelopeDetect(_: *Self, input: []const [2]f32, output: []f32) void {
@@ -251,6 +385,7 @@ pub const DecoderWorker = struct {
         const stage1_cutoff: f32 = switch (modulation) {
             .fm => intermediate_rate * 0.45,
             .am => 5000.0,
+            .nfm => 6250.0,
         };
 
         self.stage1_fir.deinit(self.alloc);
@@ -279,6 +414,7 @@ pub const DecoderWorker = struct {
         self.deemphasis = DeEmphasis.init(audio_rate, tau);
         self.prev_sample = .{ 0.0, 0.0 };
         self.dc_block.reset();
+        self.ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null;
     }
 
     pub fn reset(self: *Self) void {
@@ -288,6 +424,7 @@ pub const DecoderWorker = struct {
         self.deemphasis.reset();
         self.dc_block.reset();
         self.prev_sample = .{ 0.0, 0.0 };
+        if (self.ctcss) |*ctcss| ctcss.reset();
     }
 
     fn computeStage1Decimation(sample_rate: f32, intermediate_rate: f32) usize {
@@ -314,6 +451,7 @@ pub const RadioDecoder = struct {
     volume: std.atomic.Value(u32) = .init(@bitCast(@as(f32, 0.5))),
     tau: std.atomic.Value(u32) = .init(@bitCast(@as(f32, 75e-6))),
     modulation: std.atomic.Value(u8) = .init(0),
+    squelch_threshold: std.atomic.Value(u32) = .init(0),
 
     reconfigure_flag: std.atomic.Value(bool) = .init(false),
 
@@ -334,6 +472,7 @@ pub const RadioDecoder = struct {
     ui_modulation_index: i32 = 0,
     ui_freq_mhz: f64 = 98.1,
     ui_freq_text: [16]u8 = undefined,
+    ui_squelch_threshold: f32 = 0.0,
 
     pub fn init(alloc: std.mem.Allocator, sample_rate: f64, center_freq_mhz: f32) !Self {
         const cf: f64 = @floatCast(center_freq_mhz);
@@ -488,6 +627,9 @@ pub const RadioDecoder = struct {
             const vol: f32 = @bitCast(self.volume.load(.acquire));
             self.worker.volume = vol;
 
+            const squelch_thresh: f32 = @bitCast(self.squelch_threshold.load(.acquire));
+            self.worker.squelch_threshold = squelch_thresh;
+
             mutex.lock();
             const copied = rx_buffer.copySequential(&self.read_cursor, self.input_buf);
             mutex.unlock();
@@ -577,12 +719,17 @@ pub const RadioDecoder = struct {
 
         zgui.separatorText("Modulation");
 
-        const mod_labels: [:0]const u8 = "FM\x00AM\x00";
+        const mod_labels: [:0]const u8 = "FM\x00AM\x00NFM\x00";
         if (zgui.combo("Mode", .{
             .current_item = &self.ui_modulation_index,
             .items_separated_by_zeros = mod_labels,
         })) {
             self.modulation.store(@intCast(self.ui_modulation_index), .release);
+            if (self.ui_modulation_index == 2) {
+                const nfm_tau: f32 = 750e-6;
+                self.tau.store(@bitCast(nfm_tau), .release);
+                self.reconfigure_flag.store(true, .release);
+            }
         }
 
         zgui.separatorText("Tuning");
@@ -614,6 +761,42 @@ pub const RadioDecoder = struct {
             }
         }
 
+        if (self.ui_modulation_index == 2) {
+            zgui.text("De-emphasis: 750 us (two-way)", .{});
+
+            zgui.separatorText("Squelch");
+
+            if (zgui.sliderFloat("Threshold", .{
+                .v = &self.ui_squelch_threshold,
+                .min = 0.0,
+                .max = 0.1,
+                .cfmt = "%.4f",
+            })) {
+                self.squelch_threshold.store(@bitCast(self.ui_squelch_threshold), .release);
+            }
+
+            const sq_open = self.worker.squelch_open_atomic.load(.acquire) != 0;
+            if (sq_open) {
+                zgui.textColored(.{ 0.2, 1.0, 0.2, 1.0 }, "Squelch: OPEN", .{});
+            } else {
+                zgui.textColored(.{ 1.0, 0.3, 0.3, 1.0 }, "Squelch: CLOSED", .{});
+            }
+
+            zgui.separatorText("CTCSS");
+            const tone_idx = self.worker.ctcss_tone_index.load(.acquire);
+            if (tone_idx >= 0) {
+                const tone_hz = CtcssDetector.tone_freqs[@intCast(tone_idx)];
+                zgui.textColored(.{ 0.2, 1.0, 0.8, 1.0 }, "Tone: {d:.1} Hz", .{tone_hz});
+            } else {
+                zgui.textColored(.{ 0.6, 0.6, 0.6, 1.0 }, "Tone: None", .{});
+            }
+
+            zgui.separatorText("FRS Channels");
+            if (zgui.collapsingHeader("Channel Presets", .{})) {
+                self.renderFrsChannelTable();
+            }
+        }
+
         zgui.separatorText("Status");
 
         if (self.ui_enabled) {
@@ -621,6 +804,7 @@ pub const RadioDecoder = struct {
             const label = switch (mod) {
                 .fm => "Decoding FM",
                 .am => "Decoding AM",
+                .nfm => "Decoding NFM",
             };
             zgui.textColored(.{ 0.2, 1.0, 0.2, 1.0 }, "{s}", .{label});
         } else {
@@ -634,5 +818,70 @@ pub const RadioDecoder = struct {
         zgui.text("Audio Level:", .{});
         zgui.sameLine(.{});
         zgui.progressBar(.{ .fraction = bar_frac, .overlay = "", .w = -1.0 });
+    }
+
+    const FrsChannel = struct {
+        number: u8,
+        freq_mhz: f64,
+    };
+
+    const frs_channels = [_]FrsChannel{
+        .{ .number = 1, .freq_mhz = 462.5625 },
+        .{ .number = 2, .freq_mhz = 462.5875 },
+        .{ .number = 3, .freq_mhz = 462.6125 },
+        .{ .number = 4, .freq_mhz = 462.6375 },
+        .{ .number = 5, .freq_mhz = 462.6625 },
+        .{ .number = 6, .freq_mhz = 462.6875 },
+        .{ .number = 7, .freq_mhz = 462.7125 },
+        .{ .number = 8, .freq_mhz = 467.5625 },
+        .{ .number = 9, .freq_mhz = 467.5875 },
+        .{ .number = 10, .freq_mhz = 467.6125 },
+        .{ .number = 11, .freq_mhz = 467.6375 },
+        .{ .number = 12, .freq_mhz = 467.6625 },
+        .{ .number = 13, .freq_mhz = 467.6875 },
+        .{ .number = 14, .freq_mhz = 467.7125 },
+        .{ .number = 15, .freq_mhz = 462.5500 },
+        .{ .number = 16, .freq_mhz = 462.5750 },
+        .{ .number = 17, .freq_mhz = 462.6000 },
+        .{ .number = 18, .freq_mhz = 462.6250 },
+        .{ .number = 19, .freq_mhz = 462.6500 },
+        .{ .number = 20, .freq_mhz = 462.6750 },
+        .{ .number = 21, .freq_mhz = 462.7000 },
+        .{ .number = 22, .freq_mhz = 462.7250 },
+    };
+
+    fn renderFrsChannelTable(self: *Self) void {
+        if (zgui.beginTable("frs_channels", .{
+            .column = 3,
+            .flags = .{ .borders = .{ .inner_h = true, .outer_h = true }, .row_bg = true, .sizing = .stretch_prop, .scroll_y = true },
+            .outer_size = .{ 0.0, 300.0 },
+        })) {
+            defer zgui.endTable();
+
+            zgui.tableSetupColumn("Ch", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 30 });
+            zgui.tableSetupColumn("Freq (MHz)", .{});
+            zgui.tableSetupColumn("", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 40 });
+            zgui.tableHeadersRow();
+
+            for (frs_channels) |ch| {
+                zgui.tableNextRow(.{});
+                _ = zgui.tableNextColumn();
+                zgui.text("{d}", .{ch.number});
+                _ = zgui.tableNextColumn();
+                zgui.text("{d:.4}", .{ch.freq_mhz});
+                _ = zgui.tableNextColumn();
+
+                zgui.pushIntId(@intCast(ch.number));
+                if (zgui.smallButton("Tune")) {
+                    self.ui_modulation_index = 2;
+                    self.modulation.store(2, .release);
+                    self.setFreqMhz(ch.freq_mhz);
+                    const nfm_tau: f32 = 750e-6;
+                    self.tau.store(@bitCast(nfm_tau), .release);
+                    self.reconfigure_flag.store(true, .release);
+                }
+                zgui.popId();
+            }
+        }
     }
 };

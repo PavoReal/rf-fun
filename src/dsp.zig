@@ -10,6 +10,7 @@ pub const ThreadStats = @import("dsp/pipeline_stats.zig").ThreadStats;
 pub const DecimatingFir = @import("dsp/decimating_fir.zig").DecimatingFir;
 pub const Nco = @import("dsp/nco.zig").Nco;
 pub const DeEmphasis = @import("dsp/deemphasis.zig").DeEmphasis;
+pub const CtcssDetector = @import("dsp/ctcss_detector.zig").CtcssDetector;
 
 test {
     @import("std").testing.refAllDecls(@This());

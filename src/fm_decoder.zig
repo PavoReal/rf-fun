@@ -104,11 +104,7 @@ pub const FmDecoderWorker = struct {
 
         const len = @min(input.len, self.input_capacity);
 
-        for (input[0..len], self.nco_buf[0..len]) |sample, *out| {
-            out.* = sample.toFloat();
-        }
-
-        _ = self.nco.process(self.nco_buf[0..len], self.nco_buf[0..len]);
+        _ = self.nco.processIQ(input[0..len], self.nco_buf[0..len]);
 
         const s1_count = self.stage1_fir.process(self.nco_buf[0..len], self.stage1_buf);
         if (s1_count == 0) return;
@@ -136,14 +132,95 @@ pub const FmDecoderWorker = struct {
         }
     }
 
+    fn fastAtan2(y: f32, x: f32) f32 {
+        const abs_x = @abs(x);
+        const abs_y = @abs(y);
+        const max_val = @max(abs_x, abs_y);
+        const min_val = @min(abs_x, abs_y);
+        const z = min_val / (max_val + 1e-10);
+        const z2 = z * z;
+        var result = (0.97239411 + (-0.19194795) * z2) * z;
+        if (abs_y > abs_x) result = std.math.pi / 2.0 - result;
+        if (x < 0.0) result = std.math.pi - result;
+        if (y < 0.0) result = -result;
+        return result;
+    }
+
+    fn fastAtan2Simd(y: @Vector(8, f32), x: @Vector(8, f32)) @Vector(8, f32) {
+        const abs_x = @abs(x);
+        const abs_y = @abs(y);
+        const max_val = @max(abs_x, abs_y);
+        const min_val = @min(abs_x, abs_y);
+        const epsilon: @Vector(8, f32) = @splat(1e-10);
+        const z = min_val / (max_val + epsilon);
+        const z2 = z * z;
+        const c1: @Vector(8, f32) = @splat(0.97239411);
+        const c2: @Vector(8, f32) = @splat(-0.19194795);
+        const half_pi: @Vector(8, f32) = @splat(std.math.pi / 2.0);
+        const pi: @Vector(8, f32) = @splat(std.math.pi);
+        const zero: @Vector(8, f32) = @splat(0.0);
+        var result = (c1 + c2 * z2) * z;
+        const swap_mask = abs_y > abs_x;
+        result = @select(f32, swap_mask, half_pi - result, result);
+        const x_neg = x < zero;
+        result = @select(f32, x_neg, pi - result, result);
+        const y_neg = y < zero;
+        result = @select(f32, y_neg, -result, result);
+        return result;
+    }
+
     fn discriminate(self: *Self, input: []const [2]f32, output: []f32) void {
-        for (input, output) |sample, *out| {
-            const conj_prev = [2]f32{ self.prev_sample[0], -self.prev_sample[1] };
-            const prod_i = sample[0] * conj_prev[0] - sample[1] * conj_prev[1];
-            const prod_q = sample[0] * conj_prev[1] + sample[1] * conj_prev[0];
-            out.* = std.math.atan2(prod_q, prod_i);
-            self.prev_sample = sample;
+        if (input.len == 0) return;
+
+        {
+            const sample = input[0];
+            const prod_i = sample[0] * self.prev_sample[0] + sample[1] * self.prev_sample[1];
+            const prod_q = sample[1] * self.prev_sample[0] - sample[0] * self.prev_sample[1];
+            output[0] = fastAtan2(prod_q, prod_i);
         }
+
+        const vec_len = 8;
+        var i: usize = 1;
+        const simd_end = if (input.len > vec_len) input.len - (input.len - 1) % vec_len else 1;
+
+        while (i < simd_end) : (i += vec_len) {
+            var cur_i_arr: [vec_len]f32 = undefined;
+            var cur_q_arr: [vec_len]f32 = undefined;
+            var prev_i_arr: [vec_len]f32 = undefined;
+            var prev_q_arr: [vec_len]f32 = undefined;
+
+            for (0..vec_len) |j| {
+                cur_i_arr[j] = input[i + j][0];
+                cur_q_arr[j] = input[i + j][1];
+                prev_i_arr[j] = input[i + j - 1][0];
+                prev_q_arr[j] = input[i + j - 1][1];
+            }
+
+            const cur_i: @Vector(vec_len, f32) = cur_i_arr;
+            const cur_q: @Vector(vec_len, f32) = cur_q_arr;
+            const prev_i: @Vector(vec_len, f32) = prev_i_arr;
+            const prev_q: @Vector(vec_len, f32) = prev_q_arr;
+
+            const prod_i = cur_i * prev_i + cur_q * prev_q;
+            const prod_q = cur_q * prev_i - cur_i * prev_q;
+
+            const result = fastAtan2Simd(prod_q, prod_i);
+            const result_arr: [vec_len]f32 = result;
+
+            for (0..vec_len) |j| {
+                output[i + j] = result_arr[j];
+            }
+        }
+
+        while (i < input.len) : (i += 1) {
+            const sample = input[i];
+            const prev = input[i - 1];
+            const prod_i = sample[0] * prev[0] + sample[1] * prev[1];
+            const prod_q = sample[1] * prev[0] - sample[0] * prev[1];
+            output[i] = fastAtan2(prod_q, prod_i);
+        }
+
+        self.prev_sample = input[input.len - 1];
     }
 
     pub fn reconfigure(self: *Self, sample_rate: f64, tau: f32) !void {

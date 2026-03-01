@@ -21,7 +21,7 @@ pub fn DecimatingFir(comptime T: type) type {
 
             designFilter(coeffs, cutoff_hz, sample_rate_hz);
 
-            const delay_line = try alloc.alloc(T, num_taps);
+            const delay_line = try alloc.alloc(T, num_taps * 2);
             errdefer alloc.free(delay_line);
             @memset(delay_line, zero);
 
@@ -44,7 +44,9 @@ pub fn DecimatingFir(comptime T: type) type {
             var out_idx: usize = 0;
             for (input) |sample| {
                 self.delay_line[self.delay_pos] = sample;
-                self.delay_pos = (self.delay_pos + 1) % self.num_taps;
+                self.delay_line[self.delay_pos + self.num_taps] = sample;
+                self.delay_pos += 1;
+                if (self.delay_pos >= self.num_taps) self.delay_pos = 0;
 
                 self.phase += 1;
                 if (self.phase >= self.decimation) {
@@ -57,24 +59,51 @@ pub fn DecimatingFir(comptime T: type) type {
         }
 
         fn computeOutput(self: *Self) T {
+            const delay = self.delay_line[self.delay_pos..][0..self.num_taps];
+            const coeffs = self.coeffs;
+            const vec_len = 8;
+
             if (is_complex) {
-                var acc_i: f32 = 0.0;
-                var acc_q: f32 = 0.0;
-                var idx = self.delay_pos;
-                for (self.coeffs) |coeff| {
-                    if (idx == 0) idx = self.num_taps;
-                    idx -= 1;
-                    acc_i += self.delay_line[idx][0] * coeff;
-                    acc_q += self.delay_line[idx][1] * coeff;
+                var acc_i_v: @Vector(vec_len, f32) = @splat(0.0);
+                var acc_q_v: @Vector(vec_len, f32) = @splat(0.0);
+                var k: usize = 0;
+                const simd_end = self.num_taps - (self.num_taps % vec_len);
+
+                while (k < simd_end) : (k += vec_len) {
+                    var di: [vec_len]f32 = undefined;
+                    var dq: [vec_len]f32 = undefined;
+                    var cv: [vec_len]f32 = undefined;
+                    for (0..vec_len) |j| {
+                        di[j] = delay[k + j][0];
+                        dq[j] = delay[k + j][1];
+                        cv[j] = coeffs[k + j];
+                    }
+                    const coeff_v: @Vector(vec_len, f32) = cv;
+                    acc_i_v += @as(@Vector(vec_len, f32), di) * coeff_v;
+                    acc_q_v += @as(@Vector(vec_len, f32), dq) * coeff_v;
+                }
+
+                var acc_i = @reduce(.Add, acc_i_v);
+                var acc_q = @reduce(.Add, acc_q_v);
+                while (k < self.num_taps) : (k += 1) {
+                    acc_i += delay[k][0] * coeffs[k];
+                    acc_q += delay[k][1] * coeffs[k];
                 }
                 return .{ acc_i, acc_q };
             } else {
-                var acc: f32 = 0.0;
-                var idx = self.delay_pos;
-                for (self.coeffs) |coeff| {
-                    if (idx == 0) idx = self.num_taps;
-                    idx -= 1;
-                    acc += self.delay_line[idx] * coeff;
+                var acc_v: @Vector(vec_len, f32) = @splat(0.0);
+                var k: usize = 0;
+                const simd_end = self.num_taps - (self.num_taps % vec_len);
+
+                while (k < simd_end) : (k += vec_len) {
+                    const d: @Vector(vec_len, f32) = delay[k..][0..vec_len].*;
+                    const cv: @Vector(vec_len, f32) = coeffs[k..][0..vec_len].*;
+                    acc_v += d * cv;
+                }
+
+                var acc = @reduce(.Add, acc_v);
+                while (k < self.num_taps) : (k += 1) {
+                    acc += delay[k] * coeffs[k];
                 }
                 return acc;
             }
@@ -176,4 +205,18 @@ test "DecimatingFir attenuates above cutoff" {
         max_out = @max(max_out, @abs(s));
     }
     try testing.expect(max_out < 0.3);
+}
+
+test "DecimatingFir 63 taps SIMD + scalar tail" {
+    var fir = try DecimatingFir(f32).init(testing.allocator, 63, 100.0, 1000.0, 1);
+    defer fir.deinit(testing.allocator);
+
+    var input: [200]f32 = undefined;
+    for (&input) |*s| s.* = 1.0;
+
+    var output: [200]f32 = undefined;
+    const n = fir.process(&input, &output);
+    try testing.expectEqual(@as(usize, 200), n);
+
+    try testing.expectApproxEqAbs(@as(f32, 1.0), output[199], 0.01);
 }

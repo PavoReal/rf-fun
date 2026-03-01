@@ -17,6 +17,12 @@
 - `.{.init(0)} ** N` fails — `.init(0)` is treated as a function call on an enum literal
 - Use `[_]Type{.init(0)} ** N` to initialize arrays of atomic values with defaults
 
+## Zig 0.15 File I/O API
+- `std.io.bufferedWriter()` and `std.io.BufferedWriter` do NOT exist in Zig 0.15
+- `file.writer()` now requires a buffer argument: `file.writer(&buf)`
+- Returns a `File.Writer` struct; access `writer.interface` (a `std.Io.Writer`) for `writeAll`, `writeInt`, `writeByte`, `flush`
+- The buffer provides internal buffering — no separate buffered writer needed
+
 ## Zig Mutation Rules
 - Variables assigned once and never reassigned must be `const`, even if their value comes from a runtime call like `nanoTimestamp()`
 - Zig enforces this strictly — `var` is only for variables that are actually reassigned

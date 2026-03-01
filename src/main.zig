@@ -304,7 +304,7 @@ pub fn main() !void {
 
     var save_mgr: SaveManager = .{};
 
-    var analyzer = try SpectrumAnalyzer.init(alloc, 7, 3, config.cf_mhz, config.fsHz(), 256);
+    var analyzer = try SpectrumAnalyzer.init(alloc, 6, 3, config.cf_mhz, config.fsHz(), 256);
     defer analyzer.deinit();
 
     var radio_decoder = try RadioDecoder.init(alloc, config.fsHz(), config.cf_mhz);
@@ -444,6 +444,10 @@ pub fn main() !void {
                 }
 
                 radio_decoder.renderUi();
+
+                if (@abs(drag_freq - radio_decoder.ui_freq_mhz) > 0.0001) {
+                    drag_freq = radio_decoder.ui_freq_mhz;
+                }
 
                 const pipelines = [_]PipelineInfo{
                     .{

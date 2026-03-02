@@ -42,6 +42,8 @@ pub const BandX = struct {
     center: f64,
     half_width: f64,
     color: [4]f32 = .{ 0.0, 1.0, 0.5, 0.15 },
+    label: [16]u8 = [_]u8{0} ** 16,
+    label_len: u8 = 0,
 };
 
 pub const RenderResult = struct {
@@ -64,7 +66,7 @@ pub fn render(
     height: f32,
     overlay_text: ?[:0]const u8,
     drag_line: ?DragLine,
-    band: ?BandX,
+    bands: []const BandX,
 ) RenderResult {
     var result = RenderResult{
         .limits = .{ .x_min = 0, .x_max = 0 },
@@ -134,21 +136,28 @@ pub fn render(
             }
         }
 
+        var plot_xmin: f64 = 0;
+        var plot_xmax: f64 = 0;
+        var plot_ymin: f64 = 0;
+        var plot_ymax: f64 = 0;
+        rfFunGetPlotLimits(&plot_xmin, &plot_xmax, &plot_ymin, &plot_ymax);
+
         if (overlay_text) |txt| {
-            // Place text at center of current plot
-            var xmin: f64 = 0;
-            var xmax: f64 = 0;
-            var ymin: f64 = 0;
-            var ymax: f64 = 0;
-            rfFunGetPlotLimits(&xmin, &xmax, &ymin, &ymax);
             zgui.plot.plotText(txt, .{
-                .x = (xmin + xmax) / 2.0,
-                .y = (ymin + ymax) / 2.0,
+                .x = (plot_xmin + plot_xmax) / 2.0,
+                .y = (plot_ymin + plot_ymax) / 2.0,
             });
         }
 
-        if (band) |b| {
-            plotBandX(b.center - b.half_width, b.center + b.half_width, b.color);
+        for (bands) |b| {
+            const lo = b.center - b.half_width;
+            const hi = b.center + b.half_width;
+            if (hi < plot_xmin or lo > plot_xmax) continue;
+            plotBandX(lo, hi, b.color);
+            if (b.label_len > 0) {
+                const txt = zgui.formatZ("{s}", .{b.label[0..b.label_len]});
+                zgui.plot.plotText(txt, .{ .x = b.center, .y = plot_ymax, .pix_offset = .{ 0, 14 } });
+            }
         }
 
         if (drag_line) |dl| {
@@ -158,14 +167,7 @@ pub fn render(
         }
 
         result.hovered = zgui.plot.isPlotHovered();
-
-        // Read back plot limits before ending
-        var xmin: f64 = 0;
-        var xmax: f64 = 0;
-        var ymin: f64 = 0;
-        var ymax: f64 = 0;
-        rfFunGetPlotLimits(&xmin, &xmax, &ymin, &ymax);
-        result.limits = .{ .x_min = xmin, .x_max = xmax };
+        result.limits = .{ .x_min = plot_xmin, .x_max = plot_xmax };
 
         // Read back plot pixel position and size for alignment
         rfFunGetPlotPos(&result.plot_pos[0], &result.plot_pos[1]);

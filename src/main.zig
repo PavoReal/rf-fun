@@ -16,6 +16,9 @@ const BufferSnapshot = stats_window_mod.BufferSnapshot;
 const radio_decoder_mod = @import("radio_decoder.zig");
 const RadioDecoder = radio_decoder_mod.RadioDecoder;
 const ModulationType = radio_decoder_mod.ModulationType;
+const channel_manager_mod = @import("channel_manager.zig");
+const ChannelManager = channel_manager_mod.ChannelManager;
+const ChannelStripUi = @import("channel_strip_ui.zig").ChannelStripUi;
 const GuiState = @import("gui_state.zig").GuiState;
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
@@ -251,6 +254,7 @@ fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
     zgui.dockBuilderDockWindow("###HackRF Config", left_id);
     zgui.dockBuilderDockWindow("###Save", left_id);
     zgui.dockBuilderDockWindow("###Radio Decoder", left_id);
+    zgui.dockBuilderDockWindow("###Channel Monitor", left_id);
     zgui.dockBuilderDockWindow("###Analysis", analysis_id);
     zgui.dockBuilderDockWindow("###Stats", stats_id);
     zgui.dockBuilderDockWindow("###Data View", bottom_id);
@@ -341,6 +345,13 @@ pub fn main() !void {
     defer radio_decoder.deinit();
     radio_decoder.applyGuiState(&gui_state);
 
+    var channel_mgr = try ChannelManager.init(alloc, config.fsHz(), config.cf_mhz);
+    defer channel_mgr.deinit();
+    channel_mgr.master_volume = gui_state.channel_master_volume;
+
+    var channel_strip_ui: ChannelStripUi = .{};
+    channel_strip_ui.preset_index = gui_state.channel_preset_index;
+
     var wf_gpu = WaterfallGpu.init(gpu_device, analyzer.fftSize(), 256);
     defer wf_gpu.deinit();
 
@@ -349,6 +360,8 @@ pub fn main() !void {
 
     defer {
         gui_state.collect(&analyzer, &radio_decoder, &stats_win);
+        gui_state.channel_master_volume = channel_mgr.master_volume;
+        gui_state.channel_preset_index = channel_strip_ui.preset_index;
         gui_state.theme_index = config.theme_index;
         gui_state.font_size = zgui.getStyle().font_size_base;
         gui_state.save();
@@ -449,9 +462,11 @@ pub fn main() !void {
                         config.applyAll(sdr.?.device);
                         analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                         radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
+                        channel_mgr.updateFreqs(config.cf_mhz, config.fsHz());
                         try sdr.?.startRx();
                         try analyzer.startThread(&sdr.?.mutex, &sdr.?.rx_buffer);
                         try radio_decoder.start(&sdr.?.mutex, &sdr.?.rx_buffer);
+                        try channel_mgr.start(&sdr.?.mutex, &sdr.?.rx_buffer);
                     }
                 }
 
@@ -481,6 +496,7 @@ pub fn main() !void {
 
                 if (config.disconnect_requested) {
                     config.disconnect_requested = false;
+                    channel_mgr.stop();
                     radio_decoder.stop();
                     analyzer.stopThread();
                     sdr.?.rx_running = false;
@@ -496,6 +512,7 @@ pub fn main() !void {
                     analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                     analyzer.resetSmoothing();
                     radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
+                    channel_mgr.updateFreqs(config.cf_mhz, config.fsHz());
                     drag_freq = radio_decoder.ui_freq_mhz;
                 }
 
@@ -503,6 +520,7 @@ pub fn main() !void {
                     config.sample_rate_changed = false;
                     analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                     radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
+                    channel_mgr.updateFreqs(config.cf_mhz, config.fsHz());
                     drag_freq = radio_decoder.ui_freq_mhz;
                 }
 
@@ -520,6 +538,7 @@ pub fn main() !void {
                                 analyzer.updateFreqs(config.cf_mhz, config.fsHz());
                                 analyzer.resetSmoothing();
                                 radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
+                                channel_mgr.updateFreqs(config.cf_mhz, config.fsHz());
                                 radio_decoder.setFreqMhz(desired_freq);
                                 drag_freq = radio_decoder.ui_freq_mhz;
                             }
@@ -535,6 +554,7 @@ pub fn main() !void {
                 }
 
                 radio_decoder.renderUi();
+                channel_strip_ui.render(&channel_mgr);
 
                 if (@abs(drag_freq - radio_decoder.ui_freq_mhz) > 0.0001) {
                     drag_freq = radio_decoder.ui_freq_mhz;
@@ -635,13 +655,35 @@ pub fn main() !void {
                         marker_count = 1;
                     }
 
-                    const decode_band: ?plot.BandX = if (radio_decoder.ui_enabled) blk: {
+                    var channel_bands: [channel_manager_mod.MAX_CHANNELS + 1]plot.BandX = undefined;
+                    var band_count: usize = 0;
+
+                    if (radio_decoder.ui_enabled) {
                         const mod: ModulationType = @enumFromInt(@as(u8, @intCast(radio_decoder.ui_modulation_index)));
-                        break :blk .{
+                        channel_bands[band_count] = .{
                             .center = drag_freq,
                             .half_width = mod.bandwidthMhz() / 2.0,
+                            .color = .{ 1.0, 0.0, 1.0, 0.15 },
                         };
-                    } else null;
+                        band_count += 1;
+                    }
+
+                    if (channel_mgr.isEnabled()) {
+                        for (&channel_mgr.channels) |*slot| {
+                            if (slot.*) |*ch| {
+                                if (!ch.enabled) continue;
+                                const sq_open = ch.isSquelchOpen();
+                                channel_bands[band_count] = .{
+                                    .center = ch.config.freq_mhz,
+                                    .half_width = ch.config.modulation.bandwidthMhz() / 2.0,
+                                    .color = if (sq_open) .{ 0.1, 0.8, 0.1, 0.2 } else .{ 0.5, 0.5, 0.5, 0.1 },
+                                    .label = ch.config.label,
+                                    .label_len = ch.config.label_len,
+                                };
+                                band_count += 1;
+                            }
+                        }
+                    }
 
                     const plot_result = plot.render(
                         "FFT",
@@ -655,7 +697,7 @@ pub fn main() !void {
                         line_h,
                         null,
                         if (radio_decoder.ui_enabled) .{ .value = &drag_freq } else null,
-                        decode_band,
+                        channel_bands[0..band_count],
                     );
                     analyzer.refit_x = false;
 
@@ -697,34 +739,39 @@ pub fn main() !void {
                         const wf_screen_pos = zgui.getCursorScreenPos();
                         zgui.image(tex_ref, .{ .w = waterfall_width, .h = wf_h });
 
-                        if (radio_decoder.ui_enabled) {
+                        {
                             const x_range = plot_result.limits.x_max - plot_result.limits.x_min;
                             if (x_range > 0) {
-                                const t: f32 = @floatCast((drag_freq - plot_result.limits.x_min) / x_range);
-                                if (t >= 0.0 and t <= 1.0) {
-                                    const line_x = wf_screen_pos[0] + t * waterfall_width;
-                                    const wf_top = wf_screen_pos[1];
-                                    const wf_bot = wf_top + wf_h;
-                                    const draw_list = zgui.getWindowDrawList();
+                                const wf_top = wf_screen_pos[1];
+                                const wf_bot = wf_top + wf_h;
+                                const draw_list = zgui.getWindowDrawList();
 
-                                    if (decode_band) |b| {
+                                if (band_count > 0) {
+                                    for (channel_bands[0..band_count]) |b| {
                                         const t_lo: f32 = @floatCast(((b.center - b.half_width) - plot_result.limits.x_min) / x_range);
                                         const t_hi: f32 = @floatCast(((b.center + b.half_width) - plot_result.limits.x_min) / x_range);
+                                        if (t_hi < 0.0 or t_lo > 1.0) continue;
                                         const band_x0 = wf_screen_pos[0] + @max(0.0, t_lo) * waterfall_width;
                                         const band_x1 = wf_screen_pos[0] + @min(1.0, t_hi) * waterfall_width;
                                         draw_list.addRectFilled(.{
                                             .pmin = .{ band_x0, wf_top },
                                             .pmax = .{ band_x1, wf_bot },
-                                            .col = 0x30_FF_00_FF,
+                                            .col = zgui.colorConvertFloat4ToU32(b.color),
                                         });
                                     }
+                                }
 
-                                    draw_list.addLine(.{
-                                        .p1 = .{ line_x, wf_top },
-                                        .p2 = .{ line_x, wf_bot },
-                                        .col = 0xE6_FF_00_FF,
-                                        .thickness = 2.0,
-                                    });
+                                if (radio_decoder.ui_enabled) {
+                                    const t: f32 = @floatCast((drag_freq - plot_result.limits.x_min) / x_range);
+                                    if (t >= 0.0 and t <= 1.0) {
+                                        const line_x = wf_screen_pos[0] + t * waterfall_width;
+                                        draw_list.addLine(.{
+                                            .p1 = .{ line_x, wf_top },
+                                            .p2 = .{ line_x, wf_bot },
+                                            .col = 0xE6_FF_00_FF,
+                                            .thickness = 2.0,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -763,6 +810,7 @@ pub fn main() !void {
     }
 
     if (sdr != null) {
+        channel_mgr.stop();
         radio_decoder.stop();
         analyzer.stopThread();
         sdr.?.rx_running = false;

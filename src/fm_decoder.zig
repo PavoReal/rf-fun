@@ -35,7 +35,6 @@ pub const FmDecoderWorker = struct {
     stage1_capacity: usize,
     stage2_capacity: usize,
 
-    volume: f32,
     audio_stream: ?*c.SDL_AudioStream,
 
     peak_level: std.atomic.Value(u32) = .init(0),
@@ -84,7 +83,6 @@ pub const FmDecoderWorker = struct {
             .input_capacity = input_cap,
             .stage1_capacity = stage1_cap,
             .stage2_capacity = stage2_cap,
-            .volume = 0.5,
             .audio_stream = null,
         };
     }
@@ -117,9 +115,8 @@ pub const FmDecoderWorker = struct {
         _ = self.deemphasis.process(self.stage2_buf[0..s2_count], self.audio_buf[0..s2_count]);
 
         var peak: f32 = 0.0;
-        for (self.audio_buf[0..s2_count]) |*s| {
-            s.* *= self.volume;
-            peak = @max(peak, @abs(s.*));
+        for (self.audio_buf[0..s2_count]) |s| {
+            peak = @max(peak, @abs(s));
         }
         self.peak_level.store(@bitCast(peak), .release);
 
@@ -415,9 +412,6 @@ pub const FmDecoder = struct {
             const offset = (freq_mhz - @as(f64, @floatCast(self.center_freq_mhz))) * 1e6;
             self.worker.nco.setFrequency(offset, self.sample_rate);
 
-            const vol: f32 = @bitCast(self.volume.load(.acquire));
-            self.worker.volume = vol;
-
             mutex.lock();
             const copied = rx_buffer.copySequential(&self.read_cursor, self.input_buf);
             mutex.unlock();
@@ -467,7 +461,7 @@ pub const FmDecoder = struct {
 
         zgui.separatorText("Audio");
 
-        if (zgui.sliderFloat("Volume", .{ .v = &self.ui_volume, .min = 0.0, .max = 1.0 })) {
+        if (zgui.sliderFloat("Volume", .{ .v = &self.ui_volume, .min = 0.0, .max = 3.0 })) {
             self.volume.store(@bitCast(self.ui_volume), .release);
             if (self.audio_stream) |stream| {
                 _ = c.SDL_SetAudioStreamGain(stream, self.ui_volume);

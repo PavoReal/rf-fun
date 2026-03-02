@@ -26,3 +26,19 @@
 ## Zig Mutation Rules
 - Variables assigned once and never reassigned must be `const`, even if their value comes from a runtime call like `nanoTimestamp()`
 - Zig enforces this strictly — `var` is only for variables that are actually reassigned
+
+## Zig 0.15 File Reader API
+- `file.reader(&buf)` returns a struct with `.interface` field for the actual reader
+- Use `reader.interface.readAll()`, `reader.interface.readInt()`, `reader.interface.readByte()`, etc.
+- The `&fr.interface` pattern: create `var fr = file.reader(&buf)`, then `const reader = &fr.interface`
+
+## SSB Demodulation Architecture
+- SDR++ approach: NCO shift by ±bandwidth/2 moves desired sideband to baseband center, then take real part
+- USB: shift by -1500 Hz (negative), LSB: shift by +1500 Hz (positive) for 3kHz bandwidth
+- AGC is essential for SSB — fast attack (2ms) prevents clipping, slow decay (300ms) prevents pumping
+- De-emphasis is not used for SSB (tau = 0.0), but AGC replaces it in the audio path
+
+## Integration Pattern: Dual Source (SDR + File)
+- When adding a second data source alongside hardware, create a helper function (e.g., `getActiveSource()`) that returns a uniform interface (mutex pointer + buffer pointer)
+- Guard all hardware-specific calls (setFreq, retune) with `if (sdr != null)` checks
+- The `sdr_connected` status should check both sources: `sdr != null or file_src != null`

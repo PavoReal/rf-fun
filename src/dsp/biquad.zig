@@ -27,6 +27,24 @@ pub const Biquad = struct {
         };
     }
 
+    pub fn initLowPass(sample_rate: f32, cutoff_hz: f32, q: f32) Biquad {
+        const w0 = 2.0 * std.math.pi * cutoff_hz / sample_rate;
+        const sin_w0 = @sin(w0);
+        const cos_w0 = @cos(w0);
+        const alpha = sin_w0 / (2.0 * q);
+
+        const a0 = 1.0 + alpha;
+        const inv_a0 = 1.0 / a0;
+
+        return .{
+            .b0 = ((1.0 - cos_w0) / 2.0) * inv_a0,
+            .b1 = (1.0 - cos_w0) * inv_a0,
+            .b2 = ((1.0 - cos_w0) / 2.0) * inv_a0,
+            .a1 = (-2.0 * cos_w0) * inv_a0,
+            .a2 = (1.0 - alpha) * inv_a0,
+        };
+    }
+
     pub fn processSample(self: *Biquad, x: f32) f32 {
         const y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
@@ -118,4 +136,44 @@ test "HPF reset clears state" {
     hpf.reset();
     try testing.expectApproxEqAbs(@as(f32, 0.0), hpf.z1, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.0), hpf.z2, 1e-6);
+}
+
+test "LPF passes low frequencies" {
+    var lpf = Biquad.initLowPass(25000.0, 4000.0, 0.707);
+
+    var input: [4000]f32 = undefined;
+    var output: [4000]f32 = undefined;
+
+    for (&input, 0..) |*s, i| {
+        const t: f32 = @floatFromInt(i);
+        s.* = @sin(2.0 * std.math.pi * 100.0 * t / 25000.0);
+    }
+
+    _ = lpf.process(&input, &output);
+
+    var max_out: f32 = 0;
+    for (output[2000..]) |s| {
+        max_out = @max(max_out, @abs(s));
+    }
+    try testing.expect(max_out > 0.7);
+}
+
+test "LPF attenuates high frequencies" {
+    var lpf = Biquad.initLowPass(25000.0, 4000.0, 0.707);
+
+    var input: [4000]f32 = undefined;
+    var output: [4000]f32 = undefined;
+
+    for (&input, 0..) |*s, i| {
+        const t: f32 = @floatFromInt(i);
+        s.* = @sin(2.0 * std.math.pi * 8000.0 * t / 25000.0);
+    }
+
+    _ = lpf.process(&input, &output);
+
+    var max_out: f32 = 0;
+    for (output[2000..]) |s| {
+        max_out = @max(max_out, @abs(s));
+    }
+    try testing.expect(max_out < 0.15);
 }

@@ -8,6 +8,10 @@ const DcFilter = @import("dsp/dc_filter.zig").DcFilter;
 const CtcssDetector = @import("dsp/ctcss_detector.zig").CtcssDetector;
 const Biquad = @import("dsp/biquad.zig").Biquad;
 const NoiseSquelch = @import("dsp/noise_squelch.zig").NoiseSquelch;
+const DcsDetector = @import("dsp/dcs_detector.zig").DcsDetector;
+const ToneSquelch = @import("dsp/tone_squelch.zig").ToneSquelch;
+const Golay23_12 = @import("dsp/golay.zig").Golay23_12;
+const Scanner = @import("scanner.zig").Scanner;
 const ps = @import("dsp/pipeline_stats.zig");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -56,15 +60,18 @@ pub const ModulationType = enum(u8) {
     }
 };
 
-pub const RadioStageId = enum(u3) {
+pub const RadioStageId = enum(u4) {
     nco_mix = 0,
     stage1_decimate = 1,
     demodulate = 2,
     stage2_decimate = 3,
     deemphasis = 4,
-    squelch = 5,
-    ctcss_detect = 6,
-    audio_output = 7,
+    ctcss_detect = 5,
+    dcs_detect = 6,
+    ctcss_hpf = 7,
+    noise_squelch = 8,
+    tone_squelch = 9,
+    audio_output = 10,
 };
 
 pub const radio_stage_labels: [std.enums.values(RadioStageId).len][:0]const u8 = .{
@@ -73,8 +80,11 @@ pub const radio_stage_labels: [std.enums.values(RadioStageId).len][:0]const u8 =
     "Demodulate",
     "Stage 2 Decimate",
     "De-emphasis",
-    "Squelch",
     "CTCSS Detect",
+    "DCS Detect",
+    "CTCSS HPF",
+    "Noise Squelch",
+    "Tone Squelch",
     "Audio Output",
 };
 
@@ -103,7 +113,9 @@ pub const DecoderWorker = struct {
     stage2_capacity: usize,
 
     ctcss: ?CtcssDetector,
+    dcs: ?DcsDetector,
     noise_squelch: ?NoiseSquelch,
+    tone_squelch_state: ?ToneSquelch,
     ctcss_hpf: ?Biquad,
     squelch_threshold: f32,
 
@@ -112,9 +124,18 @@ pub const DecoderWorker = struct {
 
     peak_level: std.atomic.Value(u32) = .init(0),
     ctcss_tone_index: std.atomic.Value(i8) = .init(-1),
+    ctcss_confirmed_index: std.atomic.Value(i8) = .init(-1),
+    dcs_code_atomic: std.atomic.Value(i16) = .init(-1),
+    dcs_inverted_atomic: std.atomic.Value(u8) = .init(0),
     squelch_open_atomic: std.atomic.Value(u8) = .init(0),
+    tone_squelch_open_atomic: std.atomic.Value(u8) = .init(0),
     noise_level_atomic: std.atomic.Value(u32) = .init(0),
     noise_floor_atomic: std.atomic.Value(u32) = .init(0),
+
+    squelch_mode_atomic: std.atomic.Value(u8) = .init(0),
+    expected_ctcss_idx_atomic: std.atomic.Value(i8) = .init(-1),
+    expected_dcs_code_atomic: std.atomic.Value(i16) = .init(-1),
+    expected_dcs_inv_atomic: std.atomic.Value(u8) = .init(0),
 
     audio_underrun_count: std.atomic.Value(u64) = .init(0),
 
@@ -177,7 +198,9 @@ pub const DecoderWorker = struct {
             .stage1_capacity = stage1_cap,
             .stage2_capacity = stage2_cap,
             .ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null,
+            .dcs = if (modulation == .nfm) DcsDetector.init(audio_rate) else null,
             .noise_squelch = if (modulation == .nfm) NoiseSquelch.init(audio_rate) else null,
+            .tone_squelch_state = if (modulation == .nfm) ToneSquelch.init(audio_rate) else null,
             .ctcss_hpf = if (modulation == .nfm) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null,
             .squelch_threshold = 0.0,
             .volume = 0.5,
@@ -235,14 +258,29 @@ pub const DecoderWorker = struct {
         if (self.ctcss) |*ctcss| {
             if (ctcss.process(self.audio_buf[0..s2_count])) {
                 self.ctcss_tone_index.store(ctcss.detected_tone_index, .release);
+                self.ctcss_confirmed_index.store(ctcss.confirmed_tone_index, .release);
             }
         }
         const t5b: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.ctcss_detect, t5b - t5);
 
+        if (self.dcs) |*dcs| {
+            dcs.process(self.audio_buf[0..s2_count]);
+            if (dcs.detectedCode()) |code| {
+                self.dcs_code_atomic.store(@intCast(code), .release);
+                self.dcs_inverted_atomic.store(if (dcs.isInverted()) 1 else 0, .release);
+            } else {
+                self.dcs_code_atomic.store(-1, .release);
+            }
+        }
+        const t5c: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.dcs_detect, t5c - t5b);
+
         if (self.ctcss_hpf) |*hpf| {
             _ = hpf.process(self.audio_buf[0..s2_count], self.audio_buf[0..s2_count]);
         }
+        const t5d: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.ctcss_hpf, t5d - t5c);
 
         if (self.noise_squelch) |*sq| {
             sq.setThreshold(self.squelch_threshold);
@@ -253,8 +291,27 @@ pub const DecoderWorker = struct {
         } else {
             self.squelch_open_atomic.store(1, .release);
         }
-        const t5c: u64 = @intCast(std.time.nanoTimestamp());
-        self.timing_ema.update(.squelch, t5c - t5b);
+        const t5e: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.noise_squelch, t5e - t5d);
+
+        if (self.tone_squelch_state) |*tsq| {
+            tsq.mode = @enumFromInt(self.squelch_mode_atomic.load(.acquire));
+            tsq.expected_ctcss_index = self.expected_ctcss_idx_atomic.load(.acquire);
+            tsq.expected_dcs_code = self.expected_dcs_code_atomic.load(.acquire);
+            tsq.expected_dcs_inverted = self.expected_dcs_inv_atomic.load(.acquire);
+
+            const confirmed_ctcss = self.ctcss_confirmed_index.load(.acquire);
+            const dcs_code = self.dcs_code_atomic.load(.acquire);
+            const dcs_inv = self.dcs_inverted_atomic.load(.acquire);
+
+            _ = tsq.evaluate(confirmed_ctcss, dcs_code, dcs_inv);
+            tsq.gate(self.audio_buf[0..s2_count]);
+            self.tone_squelch_open_atomic.store(if (tsq.is_open) 1 else 0, .release);
+        } else {
+            self.tone_squelch_open_atomic.store(1, .release);
+        }
+        const t5f: u64 = @intCast(std.time.nanoTimestamp());
+        self.timing_ema.update(.tone_squelch, t5f - t5e);
 
         var peak: f32 = 0.0;
         for (self.audio_buf[0..s2_count]) |*s| {
@@ -275,7 +332,7 @@ pub const DecoderWorker = struct {
             );
         }
         const t6: u64 = @intCast(std.time.nanoTimestamp());
-        self.timing_ema.update(.audio_output, t6 - t5c);
+        self.timing_ema.update(.audio_output, t6 - t5f);
 
         self.timing_ema.updateTotal(t6 - t0);
         self.timing_ema.finalize();
@@ -422,7 +479,9 @@ pub const DecoderWorker = struct {
         self.prev_sample = .{ 0.0, 0.0 };
         self.dc_block.reset();
         self.ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null;
+        self.dcs = if (modulation == .nfm) DcsDetector.init(audio_rate) else null;
         self.noise_squelch = if (modulation == .nfm) NoiseSquelch.init(audio_rate) else null;
+        self.tone_squelch_state = if (modulation == .nfm) ToneSquelch.init(audio_rate) else null;
         self.ctcss_hpf = if (modulation == .nfm) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null;
     }
 
@@ -434,7 +493,9 @@ pub const DecoderWorker = struct {
         self.dc_block.reset();
         self.prev_sample = .{ 0.0, 0.0 };
         if (self.ctcss) |*ctcss| ctcss.reset();
+        if (self.dcs) |*dcs| dcs.reset();
         if (self.noise_squelch) |*sq| sq.reset();
+        if (self.tone_squelch_state) |*tsq| tsq.reset();
         if (self.ctcss_hpf) |*hpf| hpf.reset();
     }
 
@@ -479,6 +540,8 @@ pub const RadioDecoder = struct {
 
     audio_stream: ?*c.SDL_AudioStream = null,
 
+    scanner: Scanner = .{},
+
     ui_enabled: bool = false,
     ui_volume: f32 = 0.5,
     ui_deemphasis_index: i32 = 0,
@@ -489,6 +552,11 @@ pub const RadioDecoder = struct {
     ui_squelch_auto: bool = true,
     ui_dsp_rate: i32 = 30,
     ui_preset_index: i32 = 0,
+    ui_squelch_mode_index: i32 = 0,
+    ui_scan_hold: f32 = 2.0,
+    ui_scan_speed: f32 = 0.250,
+    ui_scan_require_tone: bool = false,
+    ui_show_activity_log: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, sample_rate: f64, center_freq_mhz: f32) !Self {
         const cf: f64 = @floatCast(center_freq_mhz);
@@ -854,14 +922,43 @@ pub const RadioDecoder = struct {
                 zgui.textColored(.{ 1.0, 0.3, 0.3, 1.0 }, "Squelch: CLOSED", .{});
             }
 
-            zgui.separatorText("CTCSS");
-            const tone_idx = self.worker.ctcss_tone_index.load(.acquire);
-            if (tone_idx >= 0) {
-                const tone_hz = CtcssDetector.tone_freqs[@intCast(tone_idx)];
-                zgui.textColored(.{ 0.2, 1.0, 0.8, 1.0 }, "Tone: {d:.1} Hz", .{tone_hz});
-            } else {
-                zgui.textColored(.{ 0.6, 0.6, 0.6, 1.0 }, "Tone: None", .{});
+            zgui.separatorText("Tone Squelch");
+
+            const squelch_mode_labels: [:0]const u8 = "Carrier Only\x00CTCSS Any\x00CTCSS Match\x00DCS Any\x00DCS Match\x00Any Tone\x00";
+            if (zgui.combo("Mode###tsq_mode", .{
+                .current_item = &self.ui_squelch_mode_index,
+                .items_separated_by_zeros = squelch_mode_labels,
+            })) {
+                self.worker.squelch_mode_atomic.store(@intCast(self.ui_squelch_mode_index), .release);
             }
+
+            const confirmed_ctcss = self.worker.ctcss_confirmed_index.load(.acquire);
+            const dcs_code_raw = self.worker.dcs_code_atomic.load(.acquire);
+            const dcs_inv = self.worker.dcs_inverted_atomic.load(.acquire);
+
+            zgui.text("Detected:", .{});
+            zgui.sameLine(.{});
+            if (confirmed_ctcss >= 0) {
+                const tone_hz = CtcssDetector.tone_freqs[@intCast(confirmed_ctcss)];
+                zgui.textColored(.{ 0.2, 1.0, 0.8, 1.0 }, "CTCSS {d:.1} Hz", .{tone_hz});
+            } else if (dcs_code_raw >= 0) {
+                const dcs_code_u16: u16 = @intCast(dcs_code_raw);
+                const octal = Golay23_12.dcsCodeToOctalString(dcs_code_u16);
+                const suffix: u8 = if (dcs_inv != 0) 'I' else 'N';
+                zgui.textColored(.{ 0.2, 0.8, 1.0, 1.0 }, "DCS D{s}{c}", .{ &octal, suffix });
+            } else {
+                zgui.textColored(.{ 0.6, 0.6, 0.6, 1.0 }, "None", .{});
+            }
+
+            const tsq_open = self.worker.tone_squelch_open_atomic.load(.acquire) != 0;
+            if (tsq_open) {
+                zgui.textColored(.{ 0.2, 1.0, 0.2, 1.0 }, "Tone Gate: OPEN", .{});
+            } else {
+                zgui.textColored(.{ 1.0, 0.3, 0.3, 1.0 }, "Tone Gate: CLOSED", .{});
+            }
+
+            zgui.separatorText("Scan");
+            self.renderScanControls();
 
             zgui.separatorText("Channel Presets");
             _ = zgui.combo("Radio", .{
@@ -869,6 +966,10 @@ pub const RadioDecoder = struct {
                 .items_separated_by_zeros = preset_labels,
             });
             self.renderChannelTable();
+
+            if (zgui.collapsingHeader("Activity Log", .{})) {
+                self.renderActivityLog();
+            }
         }
 
         zgui.separatorText("Status");
@@ -892,6 +993,81 @@ pub const RadioDecoder = struct {
         zgui.text("Audio Level:", .{});
         zgui.sameLine(.{});
         zgui.progressBar(.{ .fraction = bar_frac, .overlay = "", .w = -1.0 });
+    }
+
+    const ChannelCode = union(enum) {
+        none,
+        ctcss: u8,
+        dcs_normal: u16,
+        dcs_inverted: u16,
+    };
+
+    fn parseChannelCode(label: ?[:0]const u8) ChannelCode {
+        const lbl = label orelse return .none;
+        if (lbl.len == 0) return .none;
+
+        if (lbl[0] == 'D' and lbl.len >= 4) {
+            const suffix = lbl[lbl.len - 1];
+            if (suffix == 'N' or suffix == 'I') {
+                var code: u16 = 0;
+                for (lbl[1 .. lbl.len - 1]) |ch| {
+                    if (ch < '0' or ch > '7') return .none;
+                    code = code * 8 + @as(u16, ch - '0');
+                }
+                if (Golay23_12.isStandardDcsCode(code)) {
+                    return if (suffix == 'I') .{ .dcs_inverted = code } else .{ .dcs_normal = code };
+                }
+                return .none;
+            }
+        }
+
+        var freq: f32 = 0.0;
+        var decimal_places: u8 = 0;
+        var saw_dot = false;
+        for (lbl) |ch| {
+            if (ch == '.') {
+                saw_dot = true;
+            } else if (ch >= '0' and ch <= '9') {
+                freq = freq * 10.0 + @as(f32, @floatFromInt(ch - '0'));
+                if (saw_dot) decimal_places += 1;
+            } else {
+                return .none;
+            }
+        }
+        var div: f32 = 1.0;
+        for (0..decimal_places) |_| div *= 10.0;
+        freq /= div;
+
+        for (CtcssDetector.tone_freqs, 0..) |tone, i| {
+            if (@abs(tone - freq) < 0.15) {
+                return .{ .ctcss = @intCast(i) };
+            }
+        }
+        return .none;
+    }
+
+    fn findMatchingChannel(self: *const Self) ?usize {
+        const idx: usize = @intCast(std.math.clamp(self.ui_preset_index, 0, @as(i32, @intCast(preset_tables.len - 1))));
+        const preset = preset_tables[idx];
+
+        const confirmed_ctcss = self.worker.ctcss_confirmed_index.load(.acquire);
+        const dcs_code = self.worker.dcs_code_atomic.load(.acquire);
+        const dcs_inv = self.worker.dcs_inverted_atomic.load(.acquire);
+        const current_freq = self.ui_freq_mhz;
+
+        for (preset.channels, 0..) |ch, i| {
+            if (@abs(ch.freq_mhz - current_freq) > 0.0025) continue;
+
+            const code = parseChannelCode(ch.label);
+            const matched = switch (code) {
+                .none => true,
+                .ctcss => |tone_idx| confirmed_ctcss >= 0 and confirmed_ctcss == @as(i8, @intCast(tone_idx)),
+                .dcs_normal => |dcs_val| dcs_code >= 0 and @as(u16, @intCast(dcs_code)) == dcs_val and dcs_inv == 0,
+                .dcs_inverted => |dcs_val| dcs_code >= 0 and @as(u16, @intCast(dcs_code)) == dcs_val and dcs_inv == 1,
+            };
+            if (matched) return i;
+        }
+        return null;
     }
 
     const Channel = struct {
@@ -955,9 +1131,84 @@ pub const RadioDecoder = struct {
     };
     const preset_labels: [:0]const u8 = "FRS (Standard)\x00Retevis H777\x00";
 
+    fn renderScanControls(self: *Self) void {
+        const is_scanning = self.scanner.state != .idle;
+
+        if (!is_scanning) {
+            if (zgui.smallButton("Start Scan")) {
+                const pidx: usize = @intCast(std.math.clamp(self.ui_preset_index, 0, @as(i32, @intCast(preset_tables.len - 1))));
+                const num_ch: u8 = @intCast(preset_tables[pidx].channels.len);
+                const now_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+                self.scanner.dwell_ms = @intFromFloat(self.ui_scan_speed * 1000.0);
+                self.scanner.hold_ms = @intFromFloat(self.ui_scan_hold * 1000.0);
+                self.scanner.require_tone_match = self.ui_scan_require_tone;
+                self.scanner.start(num_ch, now_ms);
+            }
+        } else {
+            if (zgui.smallButton("Stop Scan")) {
+                self.scanner.stop();
+            }
+        }
+
+        if (zgui.sliderFloat("Hold (s)", .{ .v = &self.ui_scan_hold, .min = 0.5, .max = 10.0, .cfmt = "%.1f" })) {
+            self.scanner.hold_ms = @intFromFloat(self.ui_scan_hold * 1000.0);
+        }
+        if (zgui.sliderFloat("Speed (s)", .{ .v = &self.ui_scan_speed, .min = 0.05, .max = 2.0, .cfmt = "%.3f" })) {
+            self.scanner.dwell_ms = @intFromFloat(self.ui_scan_speed * 1000.0);
+        }
+        if (zgui.checkbox("Require tone match", .{ .v = &self.ui_scan_require_tone })) {
+            self.scanner.require_tone_match = self.ui_scan_require_tone;
+        }
+
+        if (is_scanning) {
+            const sq_open = self.worker.squelch_open_atomic.load(.acquire) != 0;
+            const tsq_open = self.worker.tone_squelch_open_atomic.load(.acquire) != 0;
+            const now_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+            const action = self.scanner.tick(now_ms, sq_open, tsq_open);
+
+            switch (action) {
+                .tune_to_channel => |ch_idx| {
+                    const pidx: usize = @intCast(std.math.clamp(self.ui_preset_index, 0, @as(i32, @intCast(preset_tables.len - 1))));
+                    const channels = preset_tables[pidx].channels;
+                    if (ch_idx < channels.len) {
+                        self.setFreqMhz(channels[ch_idx].freq_mhz);
+                        self.reconfigure_flag.store(true, .release);
+                    }
+                },
+                .stop_on_channel => |ch_idx| {
+                    const pidx: usize = @intCast(std.math.clamp(self.ui_preset_index, 0, @as(i32, @intCast(preset_tables.len - 1))));
+                    const channels = preset_tables[pidx].channels;
+                    if (ch_idx < channels.len) {
+                        self.scanner.setActiveFreq(channels[ch_idx].freq_mhz);
+                        const confirmed_ctcss = self.worker.ctcss_confirmed_index.load(.acquire);
+                        const dcs_code_raw = self.worker.dcs_code_atomic.load(.acquire);
+                        const dcs_inv = self.worker.dcs_inverted_atomic.load(.acquire);
+                        if (confirmed_ctcss >= 0) {
+                            self.scanner.setActiveTone(.ctcss, @as(i16, confirmed_ctcss));
+                        } else if (dcs_code_raw >= 0) {
+                            self.scanner.setActiveTone(
+                                if (dcs_inv != 0) .dcs_inverted else .dcs_normal,
+                                dcs_code_raw,
+                            );
+                        }
+                    }
+                },
+                .none => {},
+            }
+
+            switch (self.scanner.state) {
+                .scanning => zgui.textColored(.{ 1.0, 1.0, 0.2, 1.0 }, "Scanning Ch {d}...", .{self.scanner.current_channel + 1}),
+                .active => zgui.textColored(.{ 0.2, 1.0, 0.2, 1.0 }, "Active on Ch {d}", .{self.scanner.current_channel + 1}),
+                .holding => zgui.textColored(.{ 1.0, 0.8, 0.2, 1.0 }, "Holding Ch {d}...", .{self.scanner.current_channel + 1}),
+                .idle => zgui.textColored(.{ 0.6, 0.6, 0.6, 1.0 }, "Idle", .{}),
+            }
+        }
+    }
+
     fn renderChannelTable(self: *Self) void {
         const idx: usize = @intCast(std.math.clamp(self.ui_preset_index, 0, @as(i32, @intCast(preset_tables.len - 1))));
         const preset = preset_tables[idx];
+        const matched_ch = self.findMatchingChannel();
 
         var has_labels = false;
         for (preset.channels) |ch| {
@@ -967,7 +1218,7 @@ pub const RadioDecoder = struct {
             }
         }
 
-        const col_count: i32 = if (has_labels) 4 else 3;
+        const col_count: i32 = if (has_labels) 5 else 4;
 
         if (zgui.beginTable("channel_presets", .{
             .column = col_count,
@@ -976,6 +1227,7 @@ pub const RadioDecoder = struct {
         })) {
             defer zgui.endTable();
 
+            zgui.tableSetupColumn("", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 20 });
             zgui.tableSetupColumn("Ch", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 30 });
             zgui.tableSetupColumn("Freq (MHz)", .{});
             if (has_labels) {
@@ -984,8 +1236,19 @@ pub const RadioDecoder = struct {
             zgui.tableSetupColumn("", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 40 });
             zgui.tableHeadersRow();
 
-            for (preset.channels) |ch| {
+            for (preset.channels, 0..) |ch, i| {
                 zgui.tableNextRow(.{});
+
+                const is_matched = matched_ch != null and matched_ch.? == i;
+                if (is_matched) {
+                    zgui.tableSetBgColor(.{ .target = .row_bg0, .color = zgui.colorConvertFloat4ToU32(.{ 0.1, 0.4, 0.1, 0.5 }) });
+                }
+
+                _ = zgui.tableNextColumn();
+                if (is_matched) {
+                    zgui.textColored(.{ 0.2, 1.0, 0.2, 1.0 }, ">>", .{});
+                }
+
                 _ = zgui.tableNextColumn();
                 zgui.text("{d}", .{ch.number});
                 _ = zgui.tableNextColumn();
@@ -1007,10 +1270,44 @@ pub const RadioDecoder = struct {
                     self.tau.store(@bitCast(nfm_tau), .release);
                     self.reconfigure_flag.store(true, .release);
                 }
-
-                _ = zgui.tableNextColumn();
-                zgui.text(" ", .{});
                 zgui.popId();
+            }
+        }
+    }
+
+    fn renderActivityLog(self: *const Self) void {
+        if (self.scanner.log_count == 0) {
+            zgui.textColored(.{ 0.6, 0.6, 0.6, 1.0 }, "No activity recorded", .{});
+            return;
+        }
+
+        const max_display: u8 = @min(self.scanner.log_count, 20);
+        for (0..max_display) |ri| {
+            const entry = self.scanner.getLogEntry(@intCast(ri)) orelse continue;
+            const dur_s = @as(f32, @floatFromInt(entry.durationMs())) / 1000.0;
+
+            switch (entry.tone_type) {
+                .ctcss => {
+                    if (entry.tone_value >= 0 and entry.tone_value < CtcssDetector.num_tones) {
+                        const hz = CtcssDetector.tone_freqs[@intCast(entry.tone_value)];
+                        zgui.text("Ch {d} CTCSS {d:.1} Hz  {d:.1}s", .{ entry.channel_index + 1, hz, dur_s });
+                    } else {
+                        zgui.text("Ch {d} CTCSS  {d:.1}s", .{ entry.channel_index + 1, dur_s });
+                    }
+                },
+                .dcs_normal, .dcs_inverted => {
+                    if (entry.tone_value >= 0) {
+                        const code_u16: u16 = @intCast(entry.tone_value);
+                        const octal = Golay23_12.dcsCodeToOctalString(code_u16);
+                        const suffix: u8 = if (entry.tone_type == .dcs_inverted) 'I' else 'N';
+                        zgui.text("Ch {d} DCS D{s}{c}  {d:.1}s", .{ entry.channel_index + 1, &octal, suffix, dur_s });
+                    } else {
+                        zgui.text("Ch {d} DCS  {d:.1}s", .{ entry.channel_index + 1, dur_s });
+                    }
+                },
+                .none => {
+                    zgui.text("Ch {d}  {d:.1}s", .{ entry.channel_index + 1, dur_s });
+                },
             }
         }
     }

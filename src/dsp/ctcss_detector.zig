@@ -1,14 +1,14 @@
 const std = @import("std");
 
 pub const CtcssDetector = struct {
-    pub const num_tones = 38;
+    pub const num_tones = 50;
 
     pub const tone_freqs = [num_tones]f32{
-        67.0,  71.9,  74.4,  77.0,  79.7,  82.5,  85.4,  88.5,
-        91.5,  94.8,  97.4,  100.0, 103.5, 107.2, 110.9, 114.8,
-        118.8, 123.0, 127.3, 131.8, 136.5, 141.3, 146.2, 151.4,
-        156.7, 162.2, 167.9, 173.8, 179.9, 186.2, 192.8, 203.5,
-        210.7, 218.1, 225.7, 233.6, 241.8, 250.3,
+        67.0,  69.3,  71.9,  74.4,  77.0,  79.7,  82.5,  85.4,  88.5,  91.5,
+        94.8,  97.4,  100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3,
+        131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 159.8, 162.2, 165.5, 167.9,
+        171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 192.8, 196.6, 199.5, 203.5,
+        206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1, 259.5,
     };
 
     coeffs: [num_tones]f32,
@@ -20,6 +20,12 @@ pub const CtcssDetector = struct {
     detected_tone_index: i8,
     detected_power: f32,
     sample_rate: f32,
+    confirm_count: u8 = 0,
+    confirm_threshold: u8 = 3,
+    confirmed_tone_index: i8 = -1,
+    no_tone_count: u8 = 0,
+    drop_threshold: u8 = 5,
+    prev_raw_index: i8 = -1,
 
     pub fn init(sample_rate: f32) CtcssDetector {
         const min_cycles = 15;
@@ -56,6 +62,10 @@ pub const CtcssDetector = struct {
         self.signal_power_acc = 0.0;
         self.detected_tone_index = -1;
         self.detected_power = 0.0;
+        self.confirm_count = 0;
+        self.confirmed_tone_index = -1;
+        self.no_tone_count = 0;
+        self.prev_raw_index = -1;
     }
 
     pub fn process(self: *CtcssDetector, input: []const f32) bool {
@@ -105,6 +115,26 @@ pub const CtcssDetector = struct {
             self.detected_power = 0.0;
         }
 
+        if (self.detected_tone_index >= 0) {
+            self.no_tone_count = 0;
+            if (self.detected_tone_index == self.prev_raw_index) {
+                self.confirm_count +|= 1;
+                if (self.confirm_count >= self.confirm_threshold) {
+                    self.confirmed_tone_index = self.detected_tone_index;
+                }
+            } else {
+                self.confirm_count = 1;
+            }
+            self.prev_raw_index = self.detected_tone_index;
+        } else {
+            self.confirm_count = 0;
+            self.prev_raw_index = -1;
+            self.no_tone_count +|= 1;
+            if (self.no_tone_count >= self.drop_threshold) {
+                self.confirmed_tone_index = -1;
+            }
+        }
+
         self.state_s1 = .{0.0} ** num_tones;
         self.state_s2 = .{0.0} ** num_tones;
         self.block_count = 0;
@@ -119,6 +149,16 @@ pub const CtcssDetector = struct {
     pub fn detectedToneIndex(self: *const CtcssDetector) ?usize {
         if (self.detected_tone_index < 0) return null;
         return @intCast(self.detected_tone_index);
+    }
+
+    pub fn confirmedToneHz(self: *const CtcssDetector) ?f32 {
+        if (self.confirmed_tone_index < 0) return null;
+        return tone_freqs[@intCast(self.confirmed_tone_index)];
+    }
+
+    pub fn confirmedToneIndex(self: *const CtcssDetector) ?usize {
+        if (self.confirmed_tone_index < 0) return null;
+        return @intCast(self.confirmed_tone_index);
     }
 };
 
@@ -142,7 +182,7 @@ test "detect 100 Hz CTCSS tone" {
     try testing.expect(detected);
     const idx = detector.detectedToneIndex();
     try testing.expect(idx != null);
-    try testing.expectEqual(@as(usize, 11), idx.?);
+    try testing.expectEqual(@as(usize, 12), idx.?);
     const hz = detector.detectedToneHz();
     try testing.expect(hz != null);
     try testing.expectApproxEqAbs(@as(f32, 100.0), hz.?, 0.01);
@@ -200,10 +240,61 @@ test "reset clears state" {
     try testing.expectEqual(@as(f32, 0.0), detector.detected_power);
     try testing.expectEqual(@as(usize, 0), detector.block_count);
     try testing.expectEqual(@as(f64, 0.0), detector.signal_power_acc);
+    try testing.expectEqual(@as(u8, 0), detector.confirm_count);
+    try testing.expectEqual(@as(i8, -1), detector.confirmed_tone_index);
+    try testing.expectEqual(@as(u8, 0), detector.no_tone_count);
+    try testing.expectEqual(@as(i8, -1), detector.prev_raw_index);
     for (detector.state_s1) |s| {
         try testing.expectEqual(@as(f32, 0.0), s);
     }
     for (detector.state_s2) |s| {
         try testing.expectEqual(@as(f32, 0.0), s);
     }
+}
+
+test "hysteresis confirms stable tone" {
+    const sample_rate = 25000.0;
+    var detector = CtcssDetector.init(sample_rate);
+
+    const blocks_needed = detector.confirm_threshold + 1;
+    const num_samples = detector.block_size * blocks_needed;
+    for (0..num_samples) |i| {
+        const t: f32 = @floatFromInt(i);
+        const sample = @sin(2.0 * std.math.pi * 100.0 * t / sample_rate);
+        const buf = [_]f32{sample};
+        _ = detector.process(&buf);
+    }
+
+    try testing.expect(detector.detectedToneIndex() != null);
+    try testing.expect(detector.confirmedToneIndex() != null);
+    try testing.expectEqual(@as(usize, 12), detector.confirmedToneIndex().?);
+    const hz = detector.confirmedToneHz();
+    try testing.expect(hz != null);
+    try testing.expectApproxEqAbs(@as(f32, 100.0), hz.?, 0.01);
+}
+
+test "hysteresis drops after silence" {
+    const sample_rate = 25000.0;
+    var detector = CtcssDetector.init(sample_rate);
+
+    const confirm_blocks = detector.confirm_threshold + 1;
+    const confirm_samples = detector.block_size * confirm_blocks;
+    for (0..confirm_samples) |i| {
+        const t: f32 = @floatFromInt(i);
+        const sample = @sin(2.0 * std.math.pi * 100.0 * t / sample_rate);
+        const buf = [_]f32{sample};
+        _ = detector.process(&buf);
+    }
+
+    try testing.expect(detector.confirmedToneIndex() != null);
+
+    const silence_blocks = detector.drop_threshold + 1;
+    const silence_samples = detector.block_size * silence_blocks;
+    for (0..silence_samples) |_| {
+        const buf = [_]f32{0.0};
+        _ = detector.process(&buf);
+    }
+
+    try testing.expect(detector.confirmedToneIndex() == null);
+    try testing.expect(detector.confirmedToneHz() == null);
 }

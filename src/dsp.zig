@@ -13,6 +13,9 @@ pub const DeEmphasis = @import("dsp/deemphasis.zig").DeEmphasis;
 pub const CtcssDetector = @import("dsp/ctcss_detector.zig").CtcssDetector;
 pub const Biquad = @import("dsp/biquad.zig").Biquad;
 pub const NoiseSquelch = @import("dsp/noise_squelch.zig").NoiseSquelch;
+pub const Golay23_12 = @import("dsp/golay.zig").Golay23_12;
+pub const DcsDetector = @import("dsp/dcs_detector.zig").DcsDetector;
+pub const ToneSquelch = @import("dsp/tone_squelch.zig").ToneSquelch;
 
 test {
     @import("std").testing.refAllDecls(@This());

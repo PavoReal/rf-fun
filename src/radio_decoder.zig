@@ -1007,6 +1007,9 @@ pub const RadioDecoder = struct {
                     self.tau.store(@bitCast(nfm_tau), .release);
                     self.reconfigure_flag.store(true, .release);
                 }
+
+                _ = zgui.tableNextColumn();
+                zgui.text(" ", .{});
                 zgui.popId();
             }
         }

@@ -14,8 +14,14 @@ Secondary audio gate with modes: carrier_only, ctcss_any/match, dcs_any/match, t
 ### DONE: Scanner ✓
 Channel cycling state machine with dwell/hold timers, activity log, per-channel timestamps.
 
-### Multi-Channel Parallel Monitoring
-Monitor multiple FRS channels simultaneously by running parallel channelizers on the wideband IQ capture. Would require FFT-based channelization or multiple NCO+FIR chains.
+### DONE: Multi-Channel Parallel Monitoring ✓
+ChannelManager runs multiple DecoderWorker instances from a single thread, reads IQ once, fans out to all channels, mixes resampled audio to one SDL output. Mixing-console-style UI with per-channel volume/mute/solo and signal meters. Up to 32 channels supported.
+
+### Multi-Channel Improvements
+- Profile CPU with 16+ channels active, consider multi-threading if needed
+- Per-channel squelch threshold editing in the UI
+- Add/remove individual channels dynamically (currently preset-based)
+- Mixed modulation types per preset (FM + AM + NFM in one preset table)
 
 ### DCS Detector Tuning
 The DCS detector uses integrate-and-dump with early-late gate clock recovery. Real-world testing may reveal the need for:

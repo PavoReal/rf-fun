@@ -26,3 +26,8 @@
 ## Zig Mutation Rules
 - Variables assigned once and never reassigned must be `const`, even if their value comes from a runtime call like `nanoTimestamp()`
 - Zig enforces this strictly — `var` is only for variables that are actually reassigned
+
+## Zig @cImport Type Compatibility
+- Separate `@cImport` calls in different files produce incompatible types (even for identical includes)
+- Fix: make one file's `@cImport` `pub` and import it from other files
+- Example: `pub const c = @cImport({...})` in radio_decoder.zig, then `const c = @import("radio_decoder.zig").c` elsewhere

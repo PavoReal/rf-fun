@@ -25,6 +25,10 @@ pub const GuiState = struct {
     radio_show_activity_log: bool = false,
     radio_deviation_index: i32 = 1,
 
+    channel_master_volume: f32 = 1.0,
+    channel_preset_index: i32 = 0,
+    channel_global_squelch: f32 = -80.0,
+
     theme_index: i32 = 0,
     font_size: f32 = 13.0,
     stats_num_peaks: i32 = 0,

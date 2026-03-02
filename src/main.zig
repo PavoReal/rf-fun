@@ -348,6 +348,7 @@ pub fn main() !void {
     var channel_mgr = try ChannelManager.init(alloc, config.fsHz(), config.cf_mhz);
     defer channel_mgr.deinit();
     channel_mgr.master_volume = gui_state.channel_master_volume;
+    channel_mgr.global_squelch_db = gui_state.channel_global_squelch;
 
     var channel_strip_ui: ChannelStripUi = .{};
     channel_strip_ui.preset_index = gui_state.channel_preset_index;
@@ -362,6 +363,7 @@ pub fn main() !void {
         gui_state.collect(&analyzer, &radio_decoder, &stats_win);
         gui_state.channel_master_volume = channel_mgr.master_volume;
         gui_state.channel_preset_index = channel_strip_ui.preset_index;
+        gui_state.channel_global_squelch = channel_mgr.global_squelch_db;
         gui_state.theme_index = config.theme_index;
         gui_state.font_size = zgui.getStyle().font_size_base;
         gui_state.save();

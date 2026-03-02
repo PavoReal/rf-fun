@@ -290,7 +290,6 @@ pub const FmDecoder = struct {
     sample_rate: f64,
     center_freq_mhz: f32,
 
-    read_cursor: usize = 0,
     input_buf: []hackrf.IQSample,
 
     audio_stream: ?*c.SDL_AudioStream = null,
@@ -399,10 +398,6 @@ pub const FmDecoder = struct {
                     continue;
                 };
 
-                mutex.lock();
-                self.read_cursor = rx_buffer.total_written;
-                mutex.unlock();
-
                 if (self.audio_stream) |stream| {
                     _ = c.SDL_ClearAudioStream(stream);
                 }
@@ -413,7 +408,7 @@ pub const FmDecoder = struct {
             self.worker.nco.setFrequency(offset, self.sample_rate);
 
             mutex.lock();
-            const copied = rx_buffer.copySequential(&self.read_cursor, self.input_buf);
+            const copied = rx_buffer.copyNewest(self.input_buf);
             mutex.unlock();
 
             if (copied < 1024) {

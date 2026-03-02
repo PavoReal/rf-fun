@@ -32,6 +32,8 @@ pub const SystemSnapshot = struct {
     radio_enabled: bool = false,
     squelch_open: bool = false,
     audio_underruns: u64 = 0,
+    channel_monitor_enabled: bool = false,
+    channel_count: u8 = 0,
 };
 
 pub const PipelineInfo = struct {
@@ -158,6 +160,16 @@ pub const StatsWindow = struct {
             zgui.textColored(YELLOW, "[WARN] Audio", .{});
         } else {
             zgui.textColored(RED, "[ERR] Audio", .{});
+        }
+
+        zgui.sameLine(.{ .spacing = 16 });
+
+        if (sys.channel_monitor_enabled and sys.channel_count > 0) {
+            zgui.textColored(GREEN, "[OK] Monitor ({d}ch)", .{sys.channel_count});
+        } else if (sys.channel_monitor_enabled) {
+            zgui.textColored(YELLOW, "[--] Monitor (0ch)", .{});
+        } else {
+            zgui.textColored(GRAY, "[--] Monitor", .{});
         }
     }
 

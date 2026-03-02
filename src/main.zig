@@ -577,6 +577,12 @@ pub fn main() !void {
                         .thread_stats = radio_ts,
                         .dsp_rate = radio_decoder.dspRate(),
                     },
+                    .{
+                        .name = "Channel Monitor",
+                        .pipeline = channel_mgr.pipelineView(),
+                        .thread_stats = channel_mgr.threadStats(),
+                        .dsp_rate = channel_mgr.dspRate(),
+                    },
                 };
 
                 const buf_snap: BufferSnapshot = if (sdr != null) blk: {
@@ -598,6 +604,8 @@ pub fn main() !void {
                     .radio_enabled = radio_decoder.ui_enabled,
                     .squelch_open = radio_decoder.worker.squelch_open_atomic.load(.acquire) != 0,
                     .audio_underruns = radio_decoder.audioUnderruns(),
+                    .channel_monitor_enabled = channel_mgr.isEnabled(),
+                    .channel_count = channel_mgr.active_count,
                 };
 
                 stats_win.render(&pipelines, &analyzer.stats, analyzer.has_frame, sys);

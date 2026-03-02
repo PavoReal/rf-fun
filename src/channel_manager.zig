@@ -1,11 +1,24 @@
 const std = @import("std");
 const hackrf = @import("rf_fun");
+const ps = @import("dsp/pipeline_stats.zig");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const Channel = @import("channel.zig").Channel;
 const ChannelConfig = @import("channel.zig").ChannelConfig;
 const ModulationType = @import("radio_decoder.zig").ModulationType;
 const presets = @import("channel_presets.zig");
 pub const c = @import("radio_decoder.zig").c;
+
+pub const ChannelStageId = enum(u2) {
+    iq_copy = 0,
+    channel_process = 1,
+    mix = 2,
+};
+
+const channel_stage_labels = [3][:0]const u8{
+    "IQ Copy",
+    "Channel Process",
+    "Mix",
+};
 
 pub const MAX_CHANNELS: u8 = 32;
 const MIX_BUF_SIZE: usize = 32768;
@@ -40,6 +53,10 @@ pub const ChannelManager = struct {
     input_buf: []hackrf.IQSample,
 
     target_interval_ns: u64 = 1_000_000_000 / 30,
+
+    pipeline_stats: ps.PipelineStats(ChannelStageId) = .{},
+    thread_stats: ps.ThreadStats = .{},
+    measured_dsp_rate: std.atomic.Value(u32) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, sample_rate: f64, center_freq_mhz: f32) !Self {
         const input_buf = try alloc.alloc(hackrf.IQSample, 262144);
@@ -171,6 +188,20 @@ pub const ChannelManager = struct {
         return self.enabled.load(.acquire) != 0;
     }
 
+    pub fn pipelineView(self: *const Self) ps.PipelineView {
+        return self.pipeline_stats.view(&channel_stage_labels);
+    }
+
+    pub fn threadStats(self: *const Self) *const ps.ThreadStats {
+        return &self.thread_stats;
+    }
+
+    pub fn dspRate(self: *const Self) ?f32 {
+        const raw = self.measured_dsp_rate.load(.acquire);
+        if (raw == 0) return null;
+        return @bitCast(raw);
+    }
+
     fn createOutputStream(self: *Self) void {
         if (self.output_stream != null) return;
         var spec = c.SDL_AudioSpec{
@@ -195,8 +226,16 @@ pub const ChannelManager = struct {
 
     fn runLoop(self: *Self, mutex: *std.Thread.Mutex, rx_buffer: *FixedSizeRingBuffer(hackrf.IQSample)) void {
         var last_work_ns: i128 = std.time.nanoTimestamp();
+        var timing_ema = ps.EmaAccumulator(ChannelStageId).init(0.1);
+        var busy_ema: f64 = 0.0;
+        var busy_initialized = false;
+        const busy_alpha = 0.05;
+        var frame_count: u64 = 0;
+        var last_rate_ns: i128 = std.time.nanoTimestamp();
 
         while (self.running.load(.acquire) != 0) {
+            const loop_start: u64 = @intCast(std.time.nanoTimestamp());
+
             if (self.enabled.load(.acquire) == 0) {
                 std.Thread.sleep(10 * std.time.ns_per_ms);
                 continue;
@@ -207,14 +246,18 @@ pub const ChannelManager = struct {
                 continue;
             }
 
+            const t0: u64 = @intCast(std.time.nanoTimestamp());
             mutex.lock();
             const copied = rx_buffer.copyNewest(self.input_buf);
             mutex.unlock();
+            const t1: u64 = @intCast(std.time.nanoTimestamp());
 
             if (copied < 1024) {
                 std.Thread.sleep(1 * std.time.ns_per_ms);
                 continue;
             }
+
+            timing_ema.update(.iq_copy, t1 - t0);
 
             const iq_slice = self.input_buf[0..copied];
 
@@ -241,7 +284,29 @@ pub const ChannelManager = struct {
                 }
             }
 
+            const t2: u64 = @intCast(std.time.nanoTimestamp());
+            timing_ema.update(.channel_process, t2 - t1);
+
             self.mixChannels(any_solo);
+
+            const t3: u64 = @intCast(std.time.nanoTimestamp());
+            timing_ema.update(.mix, t3 - t2);
+
+            timing_ema.updateTotal(t3 - t0);
+            timing_ema.finalize();
+            timing_ema.publish(&self.pipeline_stats);
+            _ = self.thread_stats.iteration_count.fetchAdd(1, .monotonic);
+            frame_count += 1;
+
+            const now_ns = std.time.nanoTimestamp();
+            const rate_elapsed = now_ns - last_rate_ns;
+            if (rate_elapsed >= 500_000_000) {
+                const elapsed_s: f64 = @as(f64, @floatFromInt(rate_elapsed)) / 1e9;
+                const rate: f32 = @floatCast(@as(f64, @floatFromInt(frame_count)) / elapsed_s);
+                self.measured_dsp_rate.store(@bitCast(rate), .release);
+                frame_count = 0;
+                last_rate_ns = now_ns;
+            }
 
             const target_ns = self.target_interval_ns;
             if (target_ns > 0) {
@@ -250,6 +315,20 @@ pub const ChannelManager = struct {
                     std.Thread.sleep(@intCast(target_ns - @as(u64, @intCast(since_last))));
                 }
                 last_work_ns = std.time.nanoTimestamp();
+            }
+
+            const loop_end: u64 = @intCast(std.time.nanoTimestamp());
+            const work_dur = t3 - t0;
+            const loop_dur = loop_end - loop_start;
+            if (loop_dur > 0) {
+                const ratio = @as(f64, @floatFromInt(work_dur)) / @as(f64, @floatFromInt(loop_dur));
+                if (!busy_initialized) {
+                    busy_ema = ratio;
+                    busy_initialized = true;
+                } else {
+                    busy_ema = busy_alpha * ratio + (1.0 - busy_alpha) * busy_ema;
+                }
+                self.thread_stats.busy_pct.store(@intFromFloat(busy_ema * 10000.0), .release);
             }
         }
     }

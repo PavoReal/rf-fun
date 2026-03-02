@@ -312,6 +312,12 @@ pub const HackRFConfig = struct {
         })) {
             self.rx_buf_size_changed = true;
         }
+
+        const depth_s: f64 = if (self.fsHz() > 0)
+            @as(f64, @floatFromInt(self.rxBufSamples())) / self.fsHz()
+        else
+            0;
+        zgui.text("Buffer Duration: {d:.1}s @ {d:.0} MHz", .{ depth_s, self.fsHz() / 1e6 });
     }
 
     const theme_labels: [:0]const u8 = "Dark\x00Light\x00Classic\x00";
@@ -320,7 +326,7 @@ pub const HackRFConfig = struct {
         "cf_mhz",           "sample_rate_index", "bb_filter_index",
         "lna_gain",          "vga_gain",          "amp_enable",
         "clkout_enable",     "hw_sync",           "ui_enable",
-        "rx_overrun_limit",  "rx_buf_size_index", "theme_index",
+        "rx_overrun_limit",  "rx_buf_size_index",
     };
 
     fn shouldPersist(comptime name: []const u8) bool {

@@ -16,6 +16,7 @@ const BufferSnapshot = stats_window_mod.BufferSnapshot;
 const radio_decoder_mod = @import("radio_decoder.zig");
 const RadioDecoder = radio_decoder_mod.RadioDecoder;
 const ModulationType = radio_decoder_mod.ModulationType;
+const GuiState = @import("gui_state.zig").GuiState;
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -309,27 +310,49 @@ pub fn main() !void {
     config.load();
     defer config.save();
 
-    switch (config.theme_index) {
+    var gui_state: GuiState = .{};
+    gui_state.load();
+
+    config.theme_index = gui_state.theme_index;
+    switch (gui_state.theme_index) {
         0 => zgui.getStyle().setColorsBuiltin(.dark),
         1 => zgui.getStyle().setColorsBuiltin(.light),
         2 => zgui.getStyle().setColorsBuiltin(.classic),
         else => {},
     }
+    zgui.getStyle().font_size_base = gui_state.font_size;
 
     config.connect_requested = true;
 
     var save_mgr: SaveManager = .{};
 
-    var analyzer = try SpectrumAnalyzer.init(alloc, 6, 3, config.cf_mhz, config.fsHz(), 256);
+    var analyzer = try SpectrumAnalyzer.init(alloc, gui_state.spec_fft_size_index, gui_state.spec_window_index, config.cf_mhz, config.fsHz(), 256);
     defer analyzer.deinit();
+    analyzer.avg_count = gui_state.spec_avg_count;
+    analyzer.peak_hold_enabled = gui_state.spec_peak_hold_enabled;
+    analyzer.peak_decay_rate = gui_state.spec_peak_decay_rate;
+    analyzer.dc_filter_enabled = gui_state.spec_dc_filter_enabled;
+    analyzer.waterfall.db_min = gui_state.spec_wf_db_min;
+    analyzer.waterfall.db_max = gui_state.spec_wf_db_max;
+    analyzer.waterfall.rebuildLut();
+    analyzer.syncWorkerParams();
 
     var radio_decoder = try RadioDecoder.init(alloc, config.fsHz(), config.cf_mhz);
     defer radio_decoder.deinit();
+    radio_decoder.applyGuiState(&gui_state);
 
     var wf_gpu = WaterfallGpu.init(gpu_device, analyzer.fftSize(), 256);
     defer wf_gpu.deinit();
 
     var stats_win: StatsWindow = .{};
+    stats_win.num_display_peaks = @intCast(@max(0, gui_state.stats_num_peaks));
+
+    defer {
+        gui_state.collect(&analyzer, &radio_decoder, &stats_win);
+        gui_state.theme_index = config.theme_index;
+        gui_state.font_size = zgui.getStyle().font_size_base;
+        gui_state.save();
+    }
 
     var drag_freq: f64 = radio_decoder.ui_freq_mhz;
     var last_retune_time_ms: u64 = 0;

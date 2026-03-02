@@ -430,11 +430,7 @@ pub const SpectrumAnalyzer = struct {
         self.dsp_thread.input_buf = try self.alloc.alloc(hackrf.IQSample, new_size);
         self.dsp_thread.chunk_size = new_size;
 
-        self.dsp_thread.worker.avg_count.store(self.avg_count, .release);
-        self.dsp_thread.worker.peak_hold_enabled.store(@intFromBool(self.peak_hold_enabled), .release);
-        self.dsp_thread.worker.peak_decay_rate.store(@bitCast(self.peak_decay_rate), .release);
-        self.dsp_thread.worker.dc_filter_enabled.store(@intFromBool(self.dc_filter_enabled), .release);
-        self.dsp_thread.setTargetRate(@intCast(self.dsp_rate));
+        self.syncWorkerParams();
 
         self.waterfall.deinit(self.alloc);
         self.waterfall = try Waterfall.init(self.alloc, new_size, self.wf_history_len);
@@ -454,6 +450,14 @@ pub const SpectrumAnalyzer = struct {
         self.has_frame = false;
 
         return new_size;
+    }
+
+    pub fn syncWorkerParams(self: *Self) void {
+        self.dsp_thread.worker.avg_count.store(self.avg_count, .release);
+        self.dsp_thread.worker.peak_hold_enabled.store(@intFromBool(self.peak_hold_enabled), .release);
+        self.dsp_thread.worker.peak_decay_rate.store(@bitCast(self.peak_decay_rate), .release);
+        self.dsp_thread.worker.dc_filter_enabled.store(@intFromBool(self.dc_filter_enabled), .release);
+        self.dsp_thread.setTargetRate(@intCast(self.dsp_rate));
     }
 
     pub fn updateFreqs(self: *Self, cf_mhz: f32, fs_hz: f64) void {

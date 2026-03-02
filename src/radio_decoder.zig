@@ -58,6 +58,15 @@ pub const ModulationType = enum(u8) {
             .nfm => 750e-6,
         };
     }
+
+    pub fn deviationGain(self: ModulationType) f32 {
+        const max_deviation: f32 = switch (self) {
+            .fm => 75_000.0,
+            .nfm => 2_500.0,
+            .am => 1.0,
+        };
+        return self.intermediateRate() / (2.0 * std.math.pi * max_deviation);
+    }
 };
 
 pub const RadioStageId = enum(u4) {
@@ -101,6 +110,7 @@ pub const DecoderWorker = struct {
     dc_block: DcFilter(f32),
 
     prev_sample: [2]f32,
+    deviation_gain: f32,
 
     nco_buf: [][2]f32,
     stage1_buf: [][2]f32,
@@ -119,7 +129,6 @@ pub const DecoderWorker = struct {
     ctcss_hpf: ?Biquad,
     squelch_threshold: f32,
 
-    volume: f32,
     audio_stream: ?*c.SDL_AudioStream,
 
     peak_level: std.atomic.Value(u32) = .init(0),
@@ -189,6 +198,7 @@ pub const DecoderWorker = struct {
             .deemphasis = DeEmphasis.init(audio_rate, tau),
             .dc_block = DcFilter(f32).init(0.995),
             .prev_sample = .{ 0.0, 0.0 },
+            .deviation_gain = modulation.deviationGain(),
             .nco_buf = nco_buf,
             .stage1_buf = stage1_buf,
             .discrim_buf = discrim_buf,
@@ -203,7 +213,6 @@ pub const DecoderWorker = struct {
             .tone_squelch_state = if (modulation == .nfm) ToneSquelch.init(audio_rate) else null,
             .ctcss_hpf = if (modulation == .nfm) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null,
             .squelch_threshold = 0.0,
-            .volume = 0.5,
             .audio_stream = null,
         };
     }
@@ -234,7 +243,12 @@ pub const DecoderWorker = struct {
         self.timing_ema.update(.stage1_decimate, t2 - t1);
 
         switch (self.modulation) {
-            .fm, .nfm => self.discriminate(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]),
+            .fm, .nfm => {
+                self.discriminate(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]);
+                for (self.discrim_buf[0..s1_count]) |*s| {
+                    s.* *= self.deviation_gain;
+                }
+            },
             .am => {
                 self.envelopeDetect(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]);
                 _ = self.dc_block.process(self.discrim_buf[0..s1_count], self.discrim_buf[0..s1_count]);
@@ -314,9 +328,8 @@ pub const DecoderWorker = struct {
         self.timing_ema.update(.tone_squelch, t5f - t5e);
 
         var peak: f32 = 0.0;
-        for (self.audio_buf[0..s2_count]) |*s| {
-            s.* *= self.volume;
-            peak = @max(peak, @abs(s.*));
+        for (self.audio_buf[0..s2_count]) |s| {
+            peak = @max(peak, @abs(s));
         }
         self.peak_level.store(@bitCast(peak), .release);
 
@@ -475,6 +488,7 @@ pub const DecoderWorker = struct {
         self.stage2_capacity = new_stage2_cap;
 
         self.modulation = modulation;
+        self.deviation_gain = modulation.deviationGain();
         self.deemphasis = DeEmphasis.init(audio_rate, tau);
         self.prev_sample = .{ 0.0, 0.0 };
         self.dc_block.reset();
@@ -626,6 +640,28 @@ pub const RadioDecoder = struct {
         }
     }
 
+    const GuiState = @import("gui_state.zig").GuiState;
+
+    pub fn applyGuiState(self: *Self, gs: *const GuiState) void {
+        self.ui_volume = gs.radio_volume;
+        self.ui_modulation_index = gs.radio_modulation_index;
+        self.ui_deemphasis_index = gs.radio_deemphasis_index;
+        self.ui_squelch_threshold = gs.radio_squelch_threshold;
+        self.ui_squelch_auto = gs.radio_squelch_auto;
+        self.ui_squelch_mode_index = gs.radio_squelch_mode_index;
+        self.ui_dsp_rate = gs.radio_dsp_rate;
+        self.ui_scan_hold = gs.radio_scan_hold;
+        self.ui_scan_speed = gs.radio_scan_speed;
+        self.ui_scan_require_tone = gs.radio_scan_require_tone;
+        self.ui_show_activity_log = gs.radio_show_activity_log;
+
+        self.volume.store(@bitCast(self.ui_volume), .release);
+        self.modulation.store(@intCast(self.ui_modulation_index), .release);
+        self.squelch_threshold.store(@bitCast(self.ui_squelch_threshold), .release);
+        self.squelch_auto.store(@intFromBool(self.ui_squelch_auto), .release);
+        self.target_interval_ns.store(1_000_000_000 / @as(u64, @intCast(@max(1, self.ui_dsp_rate))), .release);
+    }
+
     fn currentModulation(self: *Self) ModulationType {
         return @enumFromInt(self.modulation.load(.acquire));
     }
@@ -712,9 +748,6 @@ pub const RadioDecoder = struct {
             const freq_mhz: f64 = @bitCast(self.freq_mhz.load(.acquire));
             const offset = (freq_mhz - @as(f64, @floatCast(self.center_freq_mhz))) * 1e6;
             self.worker.nco.setFrequency(offset, self.sample_rate);
-
-            const vol: f32 = @bitCast(self.volume.load(.acquire));
-            self.worker.volume = vol;
 
             const squelch_auto = self.squelch_auto.load(.acquire) != 0;
             if (self.worker.noise_squelch) |*sq| {

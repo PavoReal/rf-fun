@@ -168,21 +168,8 @@ pub const StatsWindow = struct {
         if (sys.sdr_connected) {
             zgui.text("HackRF I/O:  {d:.1} MB/s", .{self.throughput_mbps});
 
-            const buf_pct: f32 = if (sys.buf.capacity > 0)
-                @as(f32, @floatFromInt(sys.buf.count)) / @as(f32, @floatFromInt(sys.buf.capacity))
-            else
-                0;
-            const depth_s: f64 = if (sys.sample_rate > 0)
-                @as(f64, @floatFromInt(sys.buf.count)) / sys.sample_rate
-            else
-                0;
-            const depth_str = zgui.formatZ("{d:.2}s", .{depth_s});
-            zgui.text("RX Buffer:", .{});
-            zgui.sameLine(.{});
-            zgui.progressBar(.{ .fraction = buf_pct, .overlay = depth_str, .w = -1.0 });
         } else {
             zgui.textColored(GRAY, "HackRF I/O:  --", .{});
-            zgui.textColored(GRAY, "RX Buffer:   --", .{});
         }
 
         for (pipelines) |p| {

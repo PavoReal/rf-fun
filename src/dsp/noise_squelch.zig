@@ -81,7 +81,7 @@ pub const NoiseSquelch = struct {
             if (!self.floor_initialized) {
                 self.noise_floor_ema = rms;
                 self.floor_initialized = true;
-            } else if (self.state == .closed) {
+            } else if (self.state == .closed or self.state == .closing) {
                 const floor_alpha = 1.0 - @exp(-@as(f32, @floatFromInt(noise_input.len)) / self.floor_tc_samples);
                 self.noise_floor_ema += floor_alpha * (rms - self.noise_floor_ema);
             } else if (rms > self.noise_floor_ema) {

@@ -7,6 +7,7 @@ pub const PresetChannel = struct {
     number: u8,
     freq_mhz: f64,
     label: ?[:0]const u8 = null,
+    modulation: ?ModulationType = null,
 };
 
 pub const PresetTable = struct {

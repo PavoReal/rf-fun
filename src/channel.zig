@@ -32,9 +32,11 @@ pub const Channel = struct {
     worker: DecoderWorker,
     enabled: bool = true,
     solo: bool = false,
+    smooth_gain: f32 = 0.0,
     audio_out_count: usize = 0,
     resample_stream: ?*c.SDL_AudioStream = null,
     alloc: std.mem.Allocator,
+    pending_modulation: std.atomic.Value(i8) = .init(-1),
 
     pub fn init(alloc: std.mem.Allocator, config: ChannelConfig, sample_rate: f64, center_freq_mhz: f32) !Channel {
         const cf: f64 = @floatCast(center_freq_mhz);
@@ -133,5 +135,17 @@ pub const Channel = struct {
 
     pub fn isSquelchOpen(self: *const Channel) bool {
         return self.worker.squelch_open_atomic.load(.acquire) != 0;
+    }
+
+    pub fn requestModulationChange(self: *Channel, mod: ModulationType) void {
+        self.pending_modulation.store(@intCast(@intFromEnum(mod)), .release);
+    }
+
+    pub fn applyPendingReconfigure(self: *Channel, sample_rate: f64, center_freq_mhz: f32) void {
+        const raw = self.pending_modulation.swap(-1, .acquire);
+        if (raw < 0) return;
+        const mod: ModulationType = @enumFromInt(@as(u8, @intCast(raw)));
+        self.config.modulation = mod;
+        self.reconfigure(sample_rate, center_freq_mhz) catch {};
     }
 };

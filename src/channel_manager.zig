@@ -10,6 +10,10 @@ pub const c = @import("radio_decoder.zig").c;
 pub const MAX_CHANNELS: u8 = 32;
 const MIX_BUF_SIZE: usize = 32768;
 
+const ATTACK_COEFF: f32 = 1.0 - @exp(-1.0 / (0.005 * 48000.0));
+const RELEASE_COEFF: f32 = 1.0 - @exp(-1.0 / (0.015 * 48000.0));
+const GATE_THRESHOLD: f32 = 1e-4;
+
 pub const ChannelManager = struct {
     const Self = @This();
 
@@ -23,6 +27,7 @@ pub const ChannelManager = struct {
 
     master_volume: f32 = 1.0,
     master_muted: bool = false,
+    click_filter: bool = true,
     global_squelch_db: f32 = -80.0,
 
     thread: ?std.Thread = null,
@@ -112,7 +117,7 @@ pub const ChannelManager = struct {
         for (table.channels) |pch| {
             var config = ChannelConfig{
                 .freq_mhz = pch.freq_mhz,
-                .modulation = table.modulation,
+                .modulation = pch.modulation orelse table.modulation,
                 .squelch_db = self.global_squelch_db,
             };
             var label_buf: [16]u8 = undefined;
@@ -225,6 +230,12 @@ pub const ChannelManager = struct {
 
             for (&self.channels) |*slot| {
                 if (slot.*) |*ch| {
+                    ch.applyPendingReconfigure(self.sample_rate, self.center_freq_mhz);
+                }
+            }
+
+            for (&self.channels) |*slot| {
+                if (slot.*) |*ch| {
                     if (!ch.enabled) continue;
                     _ = ch.process(iq_slice);
                 }
@@ -252,19 +263,24 @@ pub const ChannelManager = struct {
 
         for (&self.channels) |*slot| {
             const ch = &(slot.* orelse continue);
-            if (!ch.enabled) continue;
-            if (ch.config.muted) continue;
-            if (any_solo and !ch.solo) continue;
-            if (ch.audio_out_count == 0) continue;
-
-            const audio = ch.audioSlice();
             const resample_stream = ch.resample_stream orelse continue;
 
-            _ = c.SDL_PutAudioStreamData(
-                resample_stream,
-                audio.ptr,
-                @intCast(audio.len * @sizeOf(f32)),
-            );
+            const is_active = ch.enabled and !ch.config.muted and !(any_solo and !ch.solo);
+            const target_gain: f32 = if (is_active) ch.config.volume else 0.0;
+
+            if (ch.smooth_gain < GATE_THRESHOLD and target_gain == 0.0) {
+                ch.smooth_gain = 0.0;
+                continue;
+            }
+
+            if (ch.audio_out_count > 0) {
+                const audio = ch.audioSlice();
+                _ = c.SDL_PutAudioStreamData(
+                    resample_stream,
+                    audio.ptr,
+                    @intCast(audio.len * @sizeOf(f32)),
+                );
+            }
 
             const avail = c.SDL_GetAudioStreamAvailable(resample_stream);
             if (avail <= 0) continue;
@@ -279,11 +295,22 @@ pub const ChannelManager = struct {
             if (got <= 0) continue;
 
             const got_samples: usize = @intCast(@divTrunc(got, @sizeOf(f32)));
-            const vol = ch.config.volume;
 
-            for (0..got_samples) |i| {
-                if (i >= MIX_BUF_SIZE) break;
-                self.mix_buffer[i] += self.resample_buffer[i] * vol;
+            if (self.click_filter) {
+                for (0..got_samples) |i| {
+                    if (i >= MIX_BUF_SIZE) break;
+                    const coeff = if (target_gain > ch.smooth_gain) ATTACK_COEFF else RELEASE_COEFF;
+                    ch.smooth_gain += coeff * (target_gain - ch.smooth_gain);
+                    if (ch.smooth_gain < GATE_THRESHOLD and target_gain == 0.0) ch.smooth_gain = 0.0;
+                    self.mix_buffer[i] += self.resample_buffer[i] * ch.smooth_gain;
+                }
+            } else {
+                const vol = ch.config.volume;
+                for (0..got_samples) |i| {
+                    if (i >= MIX_BUF_SIZE) break;
+                    self.mix_buffer[i] += self.resample_buffer[i] * vol;
+                }
+                ch.smooth_gain = target_gain;
             }
             mix_len = @max(mix_len, got_samples);
         }

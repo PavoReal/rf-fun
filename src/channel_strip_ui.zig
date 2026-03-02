@@ -4,6 +4,7 @@ const ChannelManager = @import("channel_manager.zig").ChannelManager;
 const MAX_CHANNELS = @import("channel_manager.zig").MAX_CHANNELS;
 const ChannelConfig = @import("channel.zig").ChannelConfig;
 const ModulationType = @import("radio_decoder.zig").ModulationType;
+const demod = @import("demod_profile.zig");
 const presets = @import("channel_presets.zig");
 const c = @import("radio_decoder.zig").c;
 
@@ -41,6 +42,9 @@ pub const ChannelStripUi = struct {
         if (zgui.checkbox("Mute All", .{ .v = &master_muted })) {
             mgr.master_muted = master_muted;
         }
+
+        zgui.sameLine(.{});
+        _ = zgui.checkbox("Click Filter", .{ .v = &mgr.click_filter });
 
         if (zgui.sliderFloat("Squelch###global_sq", .{
             .v = &mgr.global_squelch_db,
@@ -90,7 +94,7 @@ pub const ChannelStripUi = struct {
             zgui.tableSetupColumn("#", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 25 });
             zgui.tableSetupColumn("Label", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 60 });
             zgui.tableSetupColumn("Freq (MHz)", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 80 });
-            zgui.tableSetupColumn("Mod", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 35 });
+            zgui.tableSetupColumn("Mod", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 55 });
             zgui.tableSetupColumn("Signal", .{});
             zgui.tableSetupColumn("Volume", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 100 });
             zgui.tableSetupColumn("M/S", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 50 });
@@ -125,12 +129,15 @@ pub const ChannelStripUi = struct {
                 zgui.text("{d:.4}", .{ch.config.freq_mhz});
 
                 _ = zgui.tableNextColumn();
-                const mod_str: [:0]const u8 = switch (ch.config.modulation) {
-                    .fm => "FM",
-                    .am => "AM",
-                    .nfm => "NFM",
-                };
-                zgui.text("{s}", .{mod_str});
+                zgui.pushIntId(@intCast(i + 3000));
+                var mod_index: i32 = @intCast(@intFromEnum(ch.config.modulation));
+                if (zgui.combo("###mod", .{
+                    .current_item = &mod_index,
+                    .items_separated_by_zeros = demod.combo_labels,
+                })) {
+                    ch.requestModulationChange(@enumFromInt(@as(u8, @intCast(mod_index))));
+                }
+                zgui.popId();
 
                 _ = zgui.tableNextColumn();
                 const level_db = ch.signalLevelDb();

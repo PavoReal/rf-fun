@@ -15,6 +15,7 @@ const ToneSquelch = @import("dsp/tone_squelch.zig").ToneSquelch;
 const Golay23_12 = @import("dsp/golay.zig").Golay23_12;
 const Scanner = @import("scanner.zig").Scanner;
 const presets = @import("channel_presets.zig");
+const demod = @import("demod_profile.zig");
 const ps = @import("dsp/pipeline_stats.zig");
 const zgui = @import("zgui");
 pub const c = @cImport({
@@ -26,49 +27,38 @@ pub const ModulationType = enum(u8) {
     am = 1,
     nfm = 2,
 
-    pub fn intermediateRate(self: ModulationType) f32 {
+    pub fn profile(self: ModulationType) demod.DemodProfile {
         return switch (self) {
-            .fm => 400_000.0,
-            .am => 32_000.0,
-            .nfm => 50_000.0,
+            .fm => demod.fm_profile,
+            .am => demod.am_profile,
+            .nfm => demod.nfm_profile,
         };
+    }
+
+    pub fn intermediateRate(self: ModulationType) f32 {
+        return self.profile().intermediate_rate;
     }
 
     pub fn audioRate(self: ModulationType) f32 {
-        return switch (self) {
-            .fm => 50_000.0,
-            .am => 16_000.0,
-            .nfm => 25_000.0,
-        };
+        return self.profile().audio_rate;
     }
 
     pub fn stage2Decimation(self: ModulationType) usize {
-        return switch (self) {
-            .fm => 8,
-            .am => 2,
-            .nfm => 2,
-        };
+        return self.profile().stage2_decimation;
     }
 
     pub fn bandwidthMhz(self: ModulationType) f64 {
-        return self.intermediateRate() / 1e6;
+        return self.profile().intermediate_rate / 1e6;
     }
 
     pub fn defaultTau(self: ModulationType) f32 {
-        return switch (self) {
-            .fm => 75e-6,
-            .am => 0.0,
-            .nfm => 75e-6,
-        };
+        return self.profile().default_tau;
     }
 
     pub fn deviationGain(self: ModulationType, nfm_dev: f32) f32 {
-        const max_deviation: f32 = switch (self) {
-            .fm => 75_000.0,
-            .nfm => nfm_dev,
-            .am => 1.0,
-        };
-        return self.intermediateRate() / (2.0 * std.math.pi * max_deviation);
+        const p = self.profile();
+        const max_dev: f32 = if (self == .nfm) nfm_dev else p.max_deviation;
+        return p.intermediate_rate / (2.0 * std.math.pi * max_dev);
     }
 };
 
@@ -169,10 +159,11 @@ pub const DecoderWorker = struct {
         const stage1_cap = input_cap / stage1_r + 1;
         const stage2_cap = stage1_cap / s2_dec + 1;
 
-        const stage1_cutoff: f32 = switch (modulation) {
-            .fm => intermediate_rate * 0.45,
-            .am => 5000.0,
-            .nfm => (nfm_dev + 3000.0) * 1.1,
+        const p = modulation.profile();
+        const stage1_cutoff: f32 = switch (p.stage1_cutoff_mode) {
+            .proportional => intermediate_rate * p.stage1_cutoff_value,
+            .fixed => p.stage1_cutoff_value,
+            .nfm_adaptive => (nfm_dev + 3000.0) * 1.1,
         };
 
         var stage1_fir = try DecimatingFir([2]f32).init(alloc, computeTapCount(stage1_r), stage1_cutoff, sr, stage1_r);
@@ -221,13 +212,13 @@ pub const DecoderWorker = struct {
             .input_capacity = input_cap,
             .stage1_capacity = stage1_cap,
             .stage2_capacity = stage2_cap,
-            .agc = if (modulation == .am) Agc.init(0.5, 0.1, 0.01) else null,
-            .pilot_notch = if (modulation == .fm) Biquad.initNotch(audio_rate, 19000.0, 10.0) else null,
-            .ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null,
-            .dcs = if (modulation == .nfm) DcsDetector.init(audio_rate) else null,
+            .agc = if (p.has_agc) Agc.init(0.5, 0.1, 0.01) else null,
+            .pilot_notch = if (p.has_pilot_notch) Biquad.initNotch(audio_rate, p.pilot_notch_freq, 10.0) else null,
+            .ctcss = if (p.has_tone_detection) CtcssDetector.init(audio_rate) else null,
+            .dcs = if (p.has_tone_detection) DcsDetector.init(audio_rate) else null,
             .squelch = Squelch.init(intermediate_rate, audio_rate),
-            .tone_squelch_state = if (modulation == .nfm) ToneSquelch.init(audio_rate) else null,
-            .ctcss_hpf = if (modulation == .nfm) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null,
+            .tone_squelch_state = if (p.has_tone_detection) ToneSquelch.init(audio_rate) else null,
+            .ctcss_hpf = if (p.has_tone_detection) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null,
             .audio_delay = audio_delay,
             .delayed_audio_buf = delayed_audio_buf,
             .squelch_threshold = 0.0,
@@ -260,16 +251,19 @@ pub const DecoderWorker = struct {
         const t2: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.stage1_decimate, t2 - t1);
 
-        switch (self.modulation) {
-            .fm, .nfm => {
+        const prof = self.modulation.profile();
+        switch (prof.demod_method) {
+            .discriminator => {
                 self.discriminate(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]);
                 for (self.discrim_buf[0..s1_count]) |*s| {
                     s.* *= self.deviation_gain;
                 }
             },
-            .am => {
+            .envelope => {
                 self.envelopeDetect(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]);
-                _ = self.dc_block.process(self.discrim_buf[0..s1_count], self.discrim_buf[0..s1_count]);
+                if (prof.uses_dc_block) {
+                    _ = self.dc_block.process(self.discrim_buf[0..s1_count], self.discrim_buf[0..s1_count]);
+                }
             },
         }
         const t3: u64 = @intCast(std.time.nanoTimestamp());
@@ -280,9 +274,10 @@ pub const DecoderWorker = struct {
         const t4: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.stage2_decimate, t4 - t3);
 
-        switch (self.modulation) {
-            .fm, .nfm => _ = self.deemphasis.process(self.stage2_buf[0..s2_count], self.audio_buf[0..s2_count]),
-            .am => @memcpy(self.audio_buf[0..s2_count], self.stage2_buf[0..s2_count]),
+        if (prof.has_deemphasis) {
+            _ = self.deemphasis.process(self.stage2_buf[0..s2_count], self.audio_buf[0..s2_count]);
+        } else {
+            @memcpy(self.audio_buf[0..s2_count], self.stage2_buf[0..s2_count]);
         }
 
         if (self.agc) |*agc| {
@@ -495,10 +490,11 @@ pub const DecoderWorker = struct {
         const new_stage1_cap = self.input_capacity / stage1_r + 1;
         const new_stage2_cap = new_stage1_cap / s2_dec + 1;
 
-        const stage1_cutoff: f32 = switch (modulation) {
-            .fm => intermediate_rate * 0.45,
-            .am => 5000.0,
-            .nfm => (nfm_dev + 3000.0) * 1.1,
+        const p = modulation.profile();
+        const stage1_cutoff: f32 = switch (p.stage1_cutoff_mode) {
+            .proportional => intermediate_rate * p.stage1_cutoff_value,
+            .fixed => p.stage1_cutoff_value,
+            .nfm_adaptive => (nfm_dev + 3000.0) * 1.1,
         };
 
         self.stage1_fir.deinit(self.alloc);
@@ -534,13 +530,13 @@ pub const DecoderWorker = struct {
         self.deemphasis = DeEmphasis.init(audio_rate, tau);
         self.prev_sample = .{ 0.0, 0.0 };
         self.dc_block.reset();
-        self.agc = if (modulation == .am) Agc.init(0.5, 0.1, 0.01) else null;
-        self.pilot_notch = if (modulation == .fm) Biquad.initNotch(audio_rate, 19000.0, 10.0) else null;
-        self.ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null;
-        self.dcs = if (modulation == .nfm) DcsDetector.init(audio_rate) else null;
+        self.agc = if (p.has_agc) Agc.init(0.5, 0.1, 0.01) else null;
+        self.pilot_notch = if (p.has_pilot_notch) Biquad.initNotch(audio_rate, p.pilot_notch_freq, 10.0) else null;
+        self.ctcss = if (p.has_tone_detection) CtcssDetector.init(audio_rate) else null;
+        self.dcs = if (p.has_tone_detection) DcsDetector.init(audio_rate) else null;
         self.squelch = Squelch.init(intermediate_rate, audio_rate);
-        self.tone_squelch_state = if (modulation == .nfm) ToneSquelch.init(audio_rate) else null;
-        self.ctcss_hpf = if (modulation == .nfm) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null;
+        self.tone_squelch_state = if (p.has_tone_detection) ToneSquelch.init(audio_rate) else null;
+        self.ctcss_hpf = if (p.has_tone_detection) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null;
     }
 
     pub fn reset(self: *Self) void {
@@ -914,10 +910,9 @@ pub const RadioDecoder = struct {
 
         zgui.separatorText("Modulation");
 
-        const mod_labels: [:0]const u8 = "FM\x00AM\x00NFM\x00";
         if (zgui.combo("Mode", .{
             .current_item = &self.ui_modulation_index,
-            .items_separated_by_zeros = mod_labels,
+            .items_separated_by_zeros = demod.combo_labels,
         })) {
             self.modulation.store(@intCast(self.ui_modulation_index), .release);
             if (self.ui_modulation_index == 2) {

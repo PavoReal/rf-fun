@@ -6,6 +6,8 @@ const Nco = @import("dsp/nco.zig").Nco;
 const DeEmphasis = @import("dsp/deemphasis.zig").DeEmphasis;
 const DcFilter = @import("dsp/dc_filter.zig").DcFilter;
 const CtcssDetector = @import("dsp/ctcss_detector.zig").CtcssDetector;
+const Biquad = @import("dsp/biquad.zig").Biquad;
+const NoiseSquelch = @import("dsp/noise_squelch.zig").NoiseSquelch;
 const ps = @import("dsp/pipeline_stats.zig");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -101,8 +103,9 @@ pub const DecoderWorker = struct {
     stage2_capacity: usize,
 
     ctcss: ?CtcssDetector,
+    noise_squelch: ?NoiseSquelch,
+    ctcss_hpf: ?Biquad,
     squelch_threshold: f32,
-    squelch_open: bool,
 
     volume: f32,
     audio_stream: ?*c.SDL_AudioStream,
@@ -110,7 +113,10 @@ pub const DecoderWorker = struct {
     peak_level: std.atomic.Value(u32) = .init(0),
     ctcss_tone_index: std.atomic.Value(i8) = .init(-1),
     squelch_open_atomic: std.atomic.Value(u8) = .init(0),
-    audio_rms: std.atomic.Value(u32) = .init(0),
+    noise_level_atomic: std.atomic.Value(u32) = .init(0),
+    noise_floor_atomic: std.atomic.Value(u32) = .init(0),
+
+    audio_underrun_count: std.atomic.Value(u64) = .init(0),
 
     timing_ema: ps.EmaAccumulator(RadioStageId) = ps.EmaAccumulator(RadioStageId).init(0.1),
     pipeline_stats: ps.PipelineStats(RadioStageId) = .{},
@@ -171,8 +177,9 @@ pub const DecoderWorker = struct {
             .stage1_capacity = stage1_cap,
             .stage2_capacity = stage2_cap,
             .ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null,
+            .noise_squelch = if (modulation == .nfm) NoiseSquelch.init(audio_rate) else null,
+            .ctcss_hpf = if (modulation == .nfm) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null,
             .squelch_threshold = 0.0,
-            .squelch_open = true,
             .volume = 0.5,
             .audio_stream = null,
         };
@@ -233,21 +240,17 @@ pub const DecoderWorker = struct {
         const t5b: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.ctcss_detect, t5b - t5);
 
-        var rms_acc: f64 = 0.0;
-        for (self.audio_buf[0..s2_count]) |s| {
-            rms_acc += @as(f64, s) * @as(f64, s);
+        if (self.ctcss_hpf) |*hpf| {
+            _ = hpf.process(self.audio_buf[0..s2_count], self.audio_buf[0..s2_count]);
         }
-        const rms: f32 = @floatCast(@sqrt(rms_acc / @as(f64, @floatFromInt(s2_count))));
-        self.audio_rms.store(@bitCast(rms), .release);
 
-        if (self.modulation == .nfm and self.squelch_threshold > 0.0) {
-            self.squelch_open = rms > self.squelch_threshold;
-            self.squelch_open_atomic.store(if (self.squelch_open) 1 else 0, .release);
-            if (!self.squelch_open) {
-                @memset(self.audio_buf[0..s2_count], 0.0);
-            }
+        if (self.noise_squelch) |*sq| {
+            sq.setThreshold(self.squelch_threshold);
+            sq.measureAndGate(self.stage2_buf[0..s2_count], self.audio_buf[0..s2_count]);
+            self.noise_level_atomic.store(@bitCast(sq.noiseLevel()), .release);
+            self.noise_floor_atomic.store(@bitCast(sq.noiseFloor()), .release);
+            self.squelch_open_atomic.store(if (sq.isOpen()) 1 else 0, .release);
         } else {
-            self.squelch_open = true;
             self.squelch_open_atomic.store(1, .release);
         }
         const t5c: u64 = @intCast(std.time.nanoTimestamp());
@@ -261,6 +264,10 @@ pub const DecoderWorker = struct {
         self.peak_level.store(@bitCast(peak), .release);
 
         if (self.audio_stream) |stream| {
+            const queued_before = c.SDL_GetAudioStreamQueued(stream);
+            if (queued_before == 0 and s2_count > 0) {
+                _ = self.audio_underrun_count.fetchAdd(1, .monotonic);
+            }
             _ = c.SDL_PutAudioStreamData(
                 stream,
                 self.audio_buf[0..s2_count].ptr,
@@ -415,6 +422,8 @@ pub const DecoderWorker = struct {
         self.prev_sample = .{ 0.0, 0.0 };
         self.dc_block.reset();
         self.ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null;
+        self.noise_squelch = if (modulation == .nfm) NoiseSquelch.init(audio_rate) else null;
+        self.ctcss_hpf = if (modulation == .nfm) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null;
     }
 
     pub fn reset(self: *Self) void {
@@ -425,6 +434,8 @@ pub const DecoderWorker = struct {
         self.dc_block.reset();
         self.prev_sample = .{ 0.0, 0.0 };
         if (self.ctcss) |*ctcss| ctcss.reset();
+        if (self.noise_squelch) |*sq| sq.reset();
+        if (self.ctcss_hpf) |*hpf| hpf.reset();
     }
 
     fn computeStage1Decimation(sample_rate: f32, intermediate_rate: f32) usize {
@@ -452,9 +463,11 @@ pub const RadioDecoder = struct {
     tau: std.atomic.Value(u32) = .init(@bitCast(@as(f32, 75e-6))),
     modulation: std.atomic.Value(u8) = .init(0),
     squelch_threshold: std.atomic.Value(u32) = .init(0),
+    squelch_auto: std.atomic.Value(u8) = .init(1),
 
     reconfigure_flag: std.atomic.Value(bool) = .init(false),
     retune_center_requested: std.atomic.Value(u64) = .init(0),
+    target_interval_ns: std.atomic.Value(u64) = .init(1_000_000_000 / 30),
 
     thread_stats: ps.ThreadStats = .{},
     measured_dsp_rate: std.atomic.Value(u32) = .init(0),
@@ -462,7 +475,6 @@ pub const RadioDecoder = struct {
     sample_rate: f64,
     center_freq_mhz: f32,
 
-    read_cursor: usize = 0,
     input_buf: []hackrf.IQSample,
 
     audio_stream: ?*c.SDL_AudioStream = null,
@@ -474,6 +486,8 @@ pub const RadioDecoder = struct {
     ui_freq_mhz: f64 = 98.1,
     ui_freq_text: [16]u8 = undefined,
     ui_squelch_threshold: f32 = 0.0,
+    ui_squelch_auto: bool = true,
+    ui_dsp_rate: i32 = 30,
 
     pub fn init(alloc: std.mem.Allocator, sample_rate: f64, center_freq_mhz: f32) !Self {
         const cf: f64 = @floatCast(center_freq_mhz);
@@ -579,12 +593,21 @@ pub const RadioDecoder = struct {
         }
     }
 
+    pub fn setTargetRate(self: *Self, hz: u32) void {
+        if (hz == 0) {
+            self.target_interval_ns.store(0, .release);
+        } else {
+            self.target_interval_ns.store(1_000_000_000 / @as(u64, hz), .release);
+        }
+    }
+
     fn runLoop(self: *Self, mutex: *std.Thread.Mutex, rx_buffer: *FixedSizeRingBuffer(hackrf.IQSample)) void {
         var busy_ema: f64 = 0.0;
         var busy_initialized = false;
         const busy_alpha = 0.05;
         var frame_count: u32 = 0;
         var last_rate_ns: i128 = std.time.nanoTimestamp();
+        var last_work_ns: i128 = std.time.nanoTimestamp();
 
         while (self.running.load(.acquire)) {
             if (!self.enabled.load(.acquire)) {
@@ -612,10 +635,6 @@ pub const RadioDecoder = struct {
                     }
                 }
 
-                mutex.lock();
-                self.read_cursor = rx_buffer.total_written;
-                mutex.unlock();
-
                 if (self.audio_stream) |stream| {
                     _ = c.SDL_ClearAudioStream(stream);
                 }
@@ -628,11 +647,16 @@ pub const RadioDecoder = struct {
             const vol: f32 = @bitCast(self.volume.load(.acquire));
             self.worker.volume = vol;
 
+            const squelch_auto = self.squelch_auto.load(.acquire) != 0;
+            if (self.worker.noise_squelch) |*sq| {
+                sq.setAutoMode(squelch_auto);
+            }
+
             const squelch_thresh: f32 = @bitCast(self.squelch_threshold.load(.acquire));
             self.worker.squelch_threshold = squelch_thresh;
 
             mutex.lock();
-            const copied = rx_buffer.copySequential(&self.read_cursor, self.input_buf);
+            const copied = rx_buffer.copyNewest(self.input_buf);
             mutex.unlock();
 
             if (copied < 1024) {
@@ -655,6 +679,15 @@ pub const RadioDecoder = struct {
                 self.measured_dsp_rate.store(@bitCast(rate), .release);
                 frame_count = 0;
                 last_rate_ns = now_ns;
+            }
+
+            const target_ns = self.target_interval_ns.load(.acquire);
+            if (target_ns > 0) {
+                const since_last = std.time.nanoTimestamp() - last_work_ns;
+                if (since_last >= 0 and since_last < target_ns) {
+                    std.Thread.sleep(@intCast(target_ns - @as(u64, @intCast(since_last))));
+                }
+                last_work_ns = std.time.nanoTimestamp();
             }
 
             const loop_end: u64 = @intCast(std.time.nanoTimestamp());
@@ -702,6 +735,10 @@ pub const RadioDecoder = struct {
         const raw = self.measured_dsp_rate.load(.acquire);
         if (raw == 0) return null;
         return @bitCast(raw);
+    }
+
+    pub fn audioUnderruns(self: *const Self) u64 {
+        return self.worker.audio_underrun_count.load(.acquire);
     }
 
     pub fn renderUi(self: *Self) void {
@@ -775,14 +812,39 @@ pub const RadioDecoder = struct {
 
             zgui.separatorText("Squelch");
 
+            if (zgui.checkbox("Auto", .{ .v = &self.ui_squelch_auto })) {
+                self.squelch_auto.store(if (self.ui_squelch_auto) 1 else 0, .release);
+            }
+            zgui.sameLine(.{});
+            if (self.ui_squelch_auto) {
+                zgui.beginDisabled(.{});
+            }
             if (zgui.sliderFloat("Threshold", .{
                 .v = &self.ui_squelch_threshold,
                 .min = 0.0,
-                .max = 0.1,
-                .cfmt = "%.4f",
+                .max = 1.0,
+                .cfmt = "%.3f",
             })) {
                 self.squelch_threshold.store(@bitCast(self.ui_squelch_threshold), .release);
             }
+            if (self.ui_squelch_auto) {
+                zgui.endDisabled();
+            }
+
+            const noise_raw = self.worker.noise_level_atomic.load(.acquire);
+            const noise_level: f32 = @bitCast(noise_raw);
+            const noise_frac = @min(noise_level * 2.0, 1.0);
+
+            const floor_raw = self.worker.noise_floor_atomic.load(.acquire);
+            const floor_level: f32 = @bitCast(floor_raw);
+
+            if (self.ui_squelch_auto) {
+                zgui.text("Noise Floor: {d:.4} (threshold: {d:.4})", .{ floor_level, floor_level * 0.7 });
+            } else {
+                zgui.text("Noise Level:", .{});
+            }
+            zgui.sameLine(.{});
+            zgui.progressBar(.{ .fraction = noise_frac, .overlay = "", .w = -1.0 });
 
             const sq_open = self.worker.squelch_open_atomic.load(.acquire) != 0;
             if (sq_open) {

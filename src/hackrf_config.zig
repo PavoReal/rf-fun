@@ -316,6 +316,69 @@ pub const HackRFConfig = struct {
 
     const theme_labels: [:0]const u8 = "Dark\x00Light\x00Classic\x00";
 
+    const persistable_fields = [_][]const u8{
+        "cf_mhz",           "sample_rate_index", "bb_filter_index",
+        "lna_gain",          "vga_gain",          "amp_enable",
+        "clkout_enable",     "hw_sync",           "ui_enable",
+        "rx_overrun_limit",  "rx_buf_size_index", "theme_index",
+    };
+
+    fn shouldPersist(comptime name: []const u8) bool {
+        for (persistable_fields) |pf| {
+            if (std.mem.eql(u8, name, pf)) return true;
+        }
+        return false;
+    }
+
+    pub fn save(self: *const HackRFConfig) void {
+        const file = std.fs.cwd().createFile("hackrf.ini", .{}) catch return;
+        defer file.close();
+        var write_buf: [4096]u8 = undefined;
+        var w = file.writer(&write_buf);
+        const iw = &w.interface;
+        inline for (@typeInfo(HackRFConfig).@"struct".fields) |field| {
+            if (comptime shouldPersist(field.name)) {
+                const val = @field(self, field.name);
+                if (field.type == f32) {
+                    iw.print("{s}={d:.6}\n", .{ field.name, val }) catch return;
+                } else if (field.type == i32) {
+                    iw.print("{s}={d}\n", .{ field.name, val }) catch return;
+                } else if (field.type == bool) {
+                    iw.print("{s}={}\n", .{ field.name, val }) catch return;
+                }
+            }
+        }
+        iw.flush() catch {};
+    }
+
+    pub fn load(self: *HackRFConfig) void {
+        const file = std.fs.cwd().openFile("hackrf.ini", .{}) catch return;
+        defer file.close();
+        var read_buf: [4096]u8 = undefined;
+        var reader = file.reader(&read_buf);
+        const ir = &reader.interface;
+        while (ir.takeDelimiter('\n') catch null) |line_raw| {
+            const trimmed = std.mem.trimRight(u8, line_raw, "\r");
+            const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+            const key = trimmed[0..eq];
+            const val = trimmed[eq + 1 ..];
+
+            inline for (@typeInfo(HackRFConfig).@"struct".fields) |field| {
+                if (comptime shouldPersist(field.name)) {
+                    if (std.mem.eql(u8, key, field.name)) {
+                        if (field.type == f32) {
+                            @field(self, field.name) = std.fmt.parseFloat(f32, val) catch @field(self, field.name);
+                        } else if (field.type == i32) {
+                            @field(self, field.name) = std.fmt.parseInt(i32, val, 10) catch @field(self, field.name);
+                        } else if (field.type == bool) {
+                            @field(self, field.name) = std.mem.eql(u8, val, "true");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn renderGuiTab(self: *HackRFConfig) void {
         zgui.separatorText("Theme");
 

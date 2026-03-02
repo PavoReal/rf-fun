@@ -76,4 +76,6 @@ pub const PipelineView = struct {
 pub const ThreadStats = struct {
     busy_pct: std.atomic.Value(u32) = .init(0),
     iteration_count: std.atomic.Value(u64) = .init(0),
+    overrun_count: std.atomic.Value(u64) = .init(0),
+    latency_ns: std.atomic.Value(u64) = .init(0),
 };

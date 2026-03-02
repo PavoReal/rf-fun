@@ -548,10 +548,6 @@ pub const SpectrumAnalyzer = struct {
                 self.dsp_thread.worker.dc_filter_enabled.store(@intFromBool(self.dc_filter_enabled), .release);
             }
 
-            if (zgui.sliderInt("DSP Rate (Hz)", .{ .min = 1, .max = 500, .v = &self.dsp_rate })) {
-                self.dsp_thread.setTargetRate(@intCast(self.dsp_rate));
-            }
-
             _ = zgui.checkbox("Peak Hold", .{ .v = &self.peak_hold_enabled });
             self.dsp_thread.worker.peak_hold_enabled.store(@intFromBool(self.peak_hold_enabled), .release);
 

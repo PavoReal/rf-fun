@@ -11,6 +11,8 @@ pub const DecimatingFir = @import("dsp/decimating_fir.zig").DecimatingFir;
 pub const Nco = @import("dsp/nco.zig").Nco;
 pub const DeEmphasis = @import("dsp/deemphasis.zig").DeEmphasis;
 pub const CtcssDetector = @import("dsp/ctcss_detector.zig").CtcssDetector;
+pub const Biquad = @import("dsp/biquad.zig").Biquad;
+pub const NoiseSquelch = @import("dsp/noise_squelch.zig").NoiseSquelch;
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -11,6 +11,8 @@ const SaveManager = @import("save_manager.zig").SaveManager;
 const stats_window_mod = @import("stats_window.zig");
 const StatsWindow = stats_window_mod.StatsWindow;
 const PipelineInfo = stats_window_mod.PipelineInfo;
+const SystemSnapshot = stats_window_mod.SystemSnapshot;
+const BufferSnapshot = stats_window_mod.BufferSnapshot;
 const radio_decoder_mod = @import("radio_decoder.zig");
 const RadioDecoder = radio_decoder_mod.RadioDecoder;
 const ModulationType = radio_decoder_mod.ModulationType;
@@ -304,6 +306,16 @@ pub fn main() !void {
     defer zgui.backend.deinit();
 
     var config: HackRFConfig = .{};
+    config.load();
+    defer config.save();
+
+    switch (config.theme_index) {
+        0 => zgui.getStyle().setColorsBuiltin(.dark),
+        1 => zgui.getStyle().setColorsBuiltin(.light),
+        2 => zgui.getStyle().setColorsBuiltin(.classic),
+        else => {},
+    }
+
     config.connect_requested = true;
 
     var save_mgr: SaveManager = .{};
@@ -505,6 +517,8 @@ pub fn main() !void {
                     drag_freq = radio_decoder.ui_freq_mhz;
                 }
 
+                const radio_ts = radio_decoder.threadStats();
+
                 const pipelines = [_]PipelineInfo{
                     .{
                         .name = "Spectrum Analyzer",
@@ -515,11 +529,33 @@ pub fn main() !void {
                     .{
                         .name = "Radio Decoder",
                         .pipeline = radio_decoder.pipelineView(),
-                        .thread_stats = radio_decoder.threadStats(),
+                        .thread_stats = radio_ts,
                         .dsp_rate = radio_decoder.dspRate(),
                     },
                 };
-                stats_win.render(&pipelines, &analyzer.stats, analyzer.has_frame);
+
+                const buf_snap: BufferSnapshot = if (sdr != null) blk: {
+                    sdr.?.mutex.lock();
+                    defer sdr.?.mutex.unlock();
+                    break :blk .{
+                        .count = sdr.?.rx_buffer.count,
+                        .capacity = sdr.?.rx_buffer.buf.len,
+                        .total_written = sdr.?.rx_buffer.total_written,
+                        .rx_bytes = sdr.?.rx_bytes_received,
+                    };
+                } else .{};
+
+                const sys = SystemSnapshot{
+                    .fps = zgui.io.getFramerate(),
+                    .buf = buf_snap,
+                    .sample_rate = config.fsHz(),
+                    .sdr_connected = sdr != null,
+                    .radio_enabled = radio_decoder.ui_enabled,
+                    .squelch_open = radio_decoder.worker.squelch_open_atomic.load(.acquire) != 0,
+                    .audio_underruns = radio_decoder.audioUnderruns(),
+                };
+
+                stats_win.render(&pipelines, &analyzer.stats, analyzer.has_frame, sys);
 
                 const ui_result = try analyzer.renderUi(zgui.io.getFramerate(), config.cf_mhz, config.fsHz());
                 if (ui_result.resized) {

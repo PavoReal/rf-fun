@@ -16,14 +16,14 @@ pub const GuiState = struct {
     radio_volume: f32 = 0.5,
     radio_modulation_index: i32 = 0,
     radio_deemphasis_index: i32 = 0,
-    radio_squelch_threshold: f32 = 0.0,
-    radio_squelch_auto: bool = true,
+    radio_squelch_threshold: f32 = -100.0,
     radio_squelch_mode_index: i32 = 0,
     radio_dsp_rate: i32 = 30,
     radio_scan_hold: f32 = 2.0,
     radio_scan_speed: f32 = 0.250,
     radio_scan_require_tone: bool = false,
     radio_show_activity_log: bool = false,
+    radio_deviation_index: i32 = 1,
 
     theme_index: i32 = 0,
     font_size: f32 = 13.0,
@@ -88,13 +88,13 @@ pub const GuiState = struct {
         self.radio_modulation_index = decoder.ui_modulation_index;
         self.radio_deemphasis_index = decoder.ui_deemphasis_index;
         self.radio_squelch_threshold = decoder.ui_squelch_threshold;
-        self.radio_squelch_auto = decoder.ui_squelch_auto;
         self.radio_squelch_mode_index = decoder.ui_squelch_mode_index;
         self.radio_dsp_rate = decoder.ui_dsp_rate;
         self.radio_scan_hold = decoder.ui_scan_hold;
         self.radio_scan_speed = decoder.ui_scan_speed;
         self.radio_scan_require_tone = decoder.ui_scan_require_tone;
         self.radio_show_activity_log = decoder.ui_show_activity_log;
+        self.radio_deviation_index = decoder.ui_deviation_index;
 
         self.stats_num_peaks = @intCast(stats.num_display_peaks);
     }

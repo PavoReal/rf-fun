@@ -128,8 +128,10 @@ pub fn DecimatingFir(comptime T: type) type {
                 else
                     @sin(2.0 * std.math.pi * fc * x) / x;
 
-                const hamming = 0.54 - 0.46 * @cos(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n - 1)));
-                c.* = sinc * hamming;
+                const fi = @as(f32, @floatFromInt(i));
+                const fn_minus_1 = @as(f32, @floatFromInt(n - 1));
+                const blackman = 0.42 - 0.5 * @cos(2.0 * std.math.pi * fi / fn_minus_1) + 0.08 * @cos(4.0 * std.math.pi * fi / fn_minus_1);
+                c.* = sinc * blackman;
                 sum += c.*;
             }
 

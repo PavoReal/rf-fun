@@ -45,6 +45,24 @@ pub const Biquad = struct {
         };
     }
 
+    pub fn initNotch(sample_rate: f32, center_hz: f32, q: f32) Biquad {
+        const w0 = 2.0 * std.math.pi * center_hz / sample_rate;
+        const sin_w0 = @sin(w0);
+        const cos_w0 = @cos(w0);
+        const alpha = sin_w0 / (2.0 * q);
+
+        const a0 = 1.0 + alpha;
+        const inv_a0 = 1.0 / a0;
+
+        return .{
+            .b0 = 1.0 * inv_a0,
+            .b1 = (-2.0 * cos_w0) * inv_a0,
+            .b2 = 1.0 * inv_a0,
+            .a1 = (-2.0 * cos_w0) * inv_a0,
+            .a2 = (1.0 - alpha) * inv_a0,
+        };
+    }
+
     pub fn processSample(self: *Biquad, x: f32) f32 {
         const y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
@@ -176,4 +194,39 @@ test "LPF attenuates high frequencies" {
         max_out = @max(max_out, @abs(s));
     }
     try testing.expect(max_out < 0.15);
+}
+
+test "Notch attenuates 19 kHz pilot while passing 1 kHz" {
+    const sample_rate = 50000.0;
+    var notch = Biquad.initNotch(sample_rate, 19000.0, 10.0);
+
+    var input_19k: [8000]f32 = undefined;
+    var output_19k: [8000]f32 = undefined;
+    for (&input_19k, 0..) |*s, i| {
+        const t: f32 = @floatFromInt(i);
+        s.* = @sin(2.0 * std.math.pi * 19000.0 * t / sample_rate);
+    }
+    _ = notch.process(&input_19k, &output_19k);
+
+    var max_19k: f32 = 0;
+    for (output_19k[4000..]) |s| {
+        max_19k = @max(max_19k, @abs(s));
+    }
+    try testing.expect(max_19k < 0.01);
+
+    notch.reset();
+
+    var input_1k: [8000]f32 = undefined;
+    var output_1k: [8000]f32 = undefined;
+    for (&input_1k, 0..) |*s, i| {
+        const t: f32 = @floatFromInt(i);
+        s.* = @sin(2.0 * std.math.pi * 1000.0 * t / sample_rate);
+    }
+    _ = notch.process(&input_1k, &output_1k);
+
+    var max_1k: f32 = 0;
+    for (output_1k[4000..]) |s| {
+        max_1k = @max(max_1k, @abs(s));
+    }
+    try testing.expect(max_1k > 0.9);
 }

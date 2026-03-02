@@ -58,11 +58,11 @@ pub const ToneSquelch = struct {
         if (self.is_open) {
             if (self.ramp_pos < self.ramp_samples) {
                 for (audio) |*s| {
-                    const gain = if (self.ramp_samples > 0)
-                        @as(f32, @floatFromInt(@min(self.ramp_pos, self.ramp_samples))) /
-                            @as(f32, @floatFromInt(self.ramp_samples))
-                    else
-                        1.0;
+                    const gain = if (self.ramp_samples > 0) blk: {
+                        const frac = @as(f32, @floatFromInt(@min(self.ramp_pos, self.ramp_samples))) /
+                            @as(f32, @floatFromInt(self.ramp_samples));
+                        break :blk 0.5 * (1.0 - @cos(std.math.pi * frac));
+                    } else 1.0;
                     s.* *= gain;
                     if (self.ramp_pos < self.ramp_samples) self.ramp_pos += 1;
                 }
@@ -70,11 +70,11 @@ pub const ToneSquelch = struct {
         } else {
             if (self.ramp_pos < self.ramp_samples) {
                 for (audio) |*s| {
-                    const gain = if (self.ramp_samples > 0)
-                        1.0 - @as(f32, @floatFromInt(@min(self.ramp_pos, self.ramp_samples))) /
-                            @as(f32, @floatFromInt(self.ramp_samples))
-                    else
-                        0.0;
+                    const gain = if (self.ramp_samples > 0) blk: {
+                        const frac = @as(f32, @floatFromInt(@min(self.ramp_pos, self.ramp_samples))) /
+                            @as(f32, @floatFromInt(self.ramp_samples));
+                        break :blk 0.5 * (1.0 + @cos(std.math.pi * frac));
+                    } else 0.0;
                     s.* *= gain;
                     if (self.ramp_pos < self.ramp_samples) self.ramp_pos += 1;
                 }

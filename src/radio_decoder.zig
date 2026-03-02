@@ -488,6 +488,7 @@ pub const RadioDecoder = struct {
     ui_squelch_threshold: f32 = 0.0,
     ui_squelch_auto: bool = true,
     ui_dsp_rate: i32 = 30,
+    ui_preset_index: i32 = 0,
 
     pub fn init(alloc: std.mem.Allocator, sample_rate: f64, center_freq_mhz: f32) !Self {
         const cf: f64 = @floatCast(center_freq_mhz);
@@ -862,10 +863,12 @@ pub const RadioDecoder = struct {
                 zgui.textColored(.{ 0.6, 0.6, 0.6, 1.0 }, "Tone: None", .{});
             }
 
-            zgui.separatorText("FRS Channels");
-            if (zgui.collapsingHeader("Channel Presets", .{})) {
-                self.renderFrsChannelTable();
-            }
+            zgui.separatorText("Channel Presets");
+            _ = zgui.combo("Radio", .{
+                .current_item = &self.ui_preset_index,
+                .items_separated_by_zeros = preset_labels,
+            });
+            self.renderChannelTable();
         }
 
         zgui.separatorText("Status");
@@ -891,12 +894,18 @@ pub const RadioDecoder = struct {
         zgui.progressBar(.{ .fraction = bar_frac, .overlay = "", .w = -1.0 });
     }
 
-    const FrsChannel = struct {
+    const Channel = struct {
         number: u8,
         freq_mhz: f64,
+        label: ?[:0]const u8 = null,
     };
 
-    const frs_channels = [_]FrsChannel{
+    const PresetTable = struct {
+        name: [:0]const u8,
+        channels: []const Channel,
+    };
+
+    const frs_channels = [_]Channel{
         .{ .number = 1, .freq_mhz = 462.5625 },
         .{ .number = 2, .freq_mhz = 462.5875 },
         .{ .number = 3, .freq_mhz = 462.6125 },
@@ -921,9 +930,47 @@ pub const RadioDecoder = struct {
         .{ .number = 22, .freq_mhz = 462.7250 },
     };
 
-    fn renderFrsChannelTable(self: *Self) void {
-        if (zgui.beginTable("frs_channels", .{
-            .column = 3,
+    const h777_channels = [_]Channel{
+        .{ .number = 1, .freq_mhz = 462.5625, .label = "67.0" },
+        .{ .number = 2, .freq_mhz = 462.5875, .label = "118.8" },
+        .{ .number = 3, .freq_mhz = 462.6125, .label = "127.3" },
+        .{ .number = 4, .freq_mhz = 462.6375, .label = "131.8" },
+        .{ .number = 5, .freq_mhz = 462.6625, .label = "136.5" },
+        .{ .number = 6, .freq_mhz = 462.6250, .label = "127.3" },
+        .{ .number = 7, .freq_mhz = 462.7250, .label = "136.5" },
+        .{ .number = 8, .freq_mhz = 462.6875, .label = "161.3" },
+        .{ .number = 9, .freq_mhz = 462.7125, .label = "166.2" },
+        .{ .number = 10, .freq_mhz = 462.5500, .label = "123.0" },
+        .{ .number = 11, .freq_mhz = 462.5750, .label = "D743I" },
+        .{ .number = 12, .freq_mhz = 462.6000, .label = "D332I" },
+        .{ .number = 13, .freq_mhz = 462.6500, .label = "D245I" },
+        .{ .number = 14, .freq_mhz = 462.6750, .label = "D606N" },
+        .{ .number = 15, .freq_mhz = 462.7000, .label = "D731I" },
+        .{ .number = 16, .freq_mhz = 462.7250, .label = "D462I" },
+    };
+
+    const preset_tables = [_]PresetTable{
+        .{ .name = "FRS (Standard)", .channels = &frs_channels },
+        .{ .name = "Retevis H777", .channels = &h777_channels },
+    };
+    const preset_labels: [:0]const u8 = "FRS (Standard)\x00Retevis H777\x00";
+
+    fn renderChannelTable(self: *Self) void {
+        const idx: usize = @intCast(std.math.clamp(self.ui_preset_index, 0, @as(i32, @intCast(preset_tables.len - 1))));
+        const preset = preset_tables[idx];
+
+        var has_labels = false;
+        for (preset.channels) |ch| {
+            if (ch.label != null) {
+                has_labels = true;
+                break;
+            }
+        }
+
+        const col_count: i32 = if (has_labels) 4 else 3;
+
+        if (zgui.beginTable("channel_presets", .{
+            .column = col_count,
             .flags = .{ .borders = .{ .inner_h = true, .outer_h = true }, .row_bg = true, .sizing = .stretch_prop, .scroll_y = true },
             .outer_size = .{ 0.0, 300.0 },
         })) {
@@ -931,15 +978,24 @@ pub const RadioDecoder = struct {
 
             zgui.tableSetupColumn("Ch", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 30 });
             zgui.tableSetupColumn("Freq (MHz)", .{});
+            if (has_labels) {
+                zgui.tableSetupColumn("Code", .{});
+            }
             zgui.tableSetupColumn("", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 40 });
             zgui.tableHeadersRow();
 
-            for (frs_channels) |ch| {
+            for (preset.channels) |ch| {
                 zgui.tableNextRow(.{});
                 _ = zgui.tableNextColumn();
                 zgui.text("{d}", .{ch.number});
                 _ = zgui.tableNextColumn();
                 zgui.text("{d:.4}", .{ch.freq_mhz});
+                if (has_labels) {
+                    _ = zgui.tableNextColumn();
+                    if (ch.label) |lbl| {
+                        zgui.text("{s}", .{lbl});
+                    }
+                }
                 _ = zgui.tableNextColumn();
 
                 zgui.pushIntId(@intCast(ch.number));

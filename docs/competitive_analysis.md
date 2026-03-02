@@ -11,7 +11,7 @@ rf-fun is an early-stage, Zig-based SDR spectrum analyzer and radio decoder targ
 | **Language** | Zig | C++ / Python | C++ | C / C++ |
 | **Stage** | Early (learning/exploration) | Mature (20+ years) | Mature (~5 years) | Growing (~5 years) |
 | **Lines of Code** | ~10,000 | ~1,000,000+ | ~50,000-80,000 est. | ~40,000+ est. |
-| **GitHub Stars** | N/A (private) | ~5,500 | ~5,700 | ~1,500 |
+| **GitHub Stars** | N/A (private) | ~6,000 | ~5,700 | ~1,500 |
 | **License** | Private | GPL-3.0 | GPL-3.0 | GPL-3.0 |
 | **Primary Use Case** | HackRF spectrum analysis + radio decoding | General-purpose SDR framework | Lightweight SDR receiver | Blind signal analysis |
 
@@ -57,7 +57,9 @@ HackRF One --> RX Callback --> FixedSizeRingBuffer (mutex-protected)
 
 **Design Philosophy:** General-purpose signal processing framework using dataflow graphs ("flowgraphs").
 
-**Thread Model:** Each block runs in its own thread (or shares threads via thread groups). The scheduler manages data flow between blocks through circular buffers. GNU Radio 4.0 (in development) redesigns this with a compile-time graph model.
+**Thread Model (GR 3.x):** Thread-Per-Block (TPB) -- each block gets its own OS thread. The scheduler informs each thread how much input is available and how much output space exists. Blocks process data in chunks (~4096 samples). Scales to ~400 threads on 4 CPU cores. Real-time scheduling priority gives ~50% speedup for complex flowgraphs, but thread migrations between cores trash L1 cache.
+
+**Buffer Architecture:** Uses a clever virtual-memory double-mapping technique to create zero-copy circular ring buffers. The OS maps the same physical memory twice, back-to-back, so blocks see a contiguous linear buffer that wraps seamlessly. A buffer has exactly one writer but can have multiple readers.
 
 **Core Abstraction:** The `gr::block` -- a processing unit with typed input/output ports. Blocks connect into a `gr::top_block` flowgraph. The scheduler manages buffer allocation, threading, and flow control automatically.
 
@@ -65,22 +67,33 @@ HackRF One --> RX Callback --> FixedSizeRingBuffer (mutex-protected)
 Source Block --> [Buffer] --> Processing Block --> [Buffer] --> Sink Block
                                   |
                             (each block = 1 thread)
-                            (buffers = circular, page-aligned)
+                            (buffers = circular, page-aligned, VM double-mapped)
 ```
+
+**SIMD: VOLK Library.** Hand-written SIMD kernels for each ISA (SSE, AVX2, AVX-512, NEON). Runtime profiling (`volk_profile`) selects optimal kernel per CPU. 50%+ improvement on complex math; 350% speedup on log calculations. Requires manual kernel authoring per architecture -- contrast with Zig's `@Vector` which auto-generates for the target.
+
+**GNU Radio 4.0 (Beta, no release date):** Complete rewrite in C++23. Header-only library with lock-free circular buffers, compile-time type checking, modular schedulers, `processOne()` API, heterogeneous CPU/GPU/FPGA scheduling (SYCL/CUDA prototypes). Can produce 2-3 MB standalone executables. MIT licensed (core). This directly addresses the same optimization space rf-fun's architecture already occupies.
 
 **Strengths:**
 - Arbitrary graph topologies (fan-out, fan-in, feedback loops)
-- Massive block library (1000+ blocks)
+- Massive block library (1000+ in-tree blocks, 150+ OOT community modules on CGRAN)
 - Python bindings for rapid prototyping; C++ for performance
-- GNU Radio Companion: visual flowgraph editor
+- GNU Radio Companion: visual drag-and-drop flowgraph editor
 - Industry standard with 20+ years of battle testing
+- VOLK for hand-optimized SIMD across architectures
+- GR4 modernization validates the compile-time optimization approach
 
 **Weaknesses:**
 - Per-block threading creates overhead for simple pipelines (context switches, cache misses)
 - Buffer management overhead between every block
 - Python GIL limits multi-core Python processing
-- Large framework footprint (~1M+ LoC, heavy dependency chain)
+- Large framework footprint (~438K LoC core, heavy dependency chain: CMake + C++ + Python + pybind11 + YAML)
 - GNU Radio 4.0 rewrite has been in progress for years (API instability risk)
+- SWIG-to-pybind11 migration broke all OOT modules; version fragmentation across 3.7-3.10
+- Steep learning curve acknowledged even by GNU Radio's own documentation
+- Dynamic typing at block boundaries -- type mismatches only caught at runtime
+- Latency drift reported: flowgraphs that start at ~1s degrade to tens of seconds over hours
+- Qt-based graphical sinks consume significant CPU; two sinks at once can be unusable on modest hardware
 
 ### SDR++
 
@@ -161,6 +174,22 @@ Source Module -> IQ Frontend (FFT) -> VFO Manager -> Decoder -> Sink
 | Zoom/Pan | Interactive | Via GUI | Yes | Full-waterfall zoom |
 | Click-to-Tune | Yes | No (graph-based) | Yes | Yes |
 
+### Visualization Depth
+
+GNU Radio's Qt GUI module provides 9+ specialized visualization sinks that none of the other tools fully match:
+
+| Visualization | rf-fun | GNU Radio | SDR++ | SigDigger |
+|---|---|---|---|---|
+| FFT Spectrum | Yes | Yes (Frequency Sink) | Yes | Yes |
+| Waterfall | Yes | Yes (Waterfall Sink) | Yes | Yes (OpenGL) |
+| Time Domain | No | Yes (Time Sink) | No | Yes (Waveform) |
+| Constellation | No | Yes (Constellation Sink) | No | Yes |
+| Eye Diagram | No | Yes (Eye Pattern) | No | No |
+| Histogram | No | Yes (Histogram Sink) | No | No |
+| Time Raster | No | Yes (Time Raster Sink) | No | No |
+| Combined View | No | Yes (all-in-one) | No | No |
+| GPU-Accelerated | SDL3 texture | Fosphor (OpenCL) | GLFW/OpenGL | Qt/OpenGL |
+
 ### Demodulation
 
 | Mode | rf-fun | GNU Radio | SDR++ | SigDigger |
@@ -228,7 +257,7 @@ rf-fun has a focused, deep feature set in its niche (HackRF spectrum analysis + 
 | Factor | rf-fun | GNU Radio | SDR++ | SigDigger |
 |---|---|---|---|---|
 | Language Overhead | Minimal (Zig = C-level) | C++ (some abstraction cost) | C++ | C (DSP) / C++ (GUI) |
-| SIMD | Manual 8-wide @Vector | Via VOLK library | Via VOLK library | Custom in sigutils |
+| SIMD | Zig @Vector (auto-target) | VOLK (hand-written per ISA) | VOLK | Custom in sigutils |
 | FFT | FFTW3 (system lib) | FFTW3 | FFTW3 | Custom (sigutils) |
 | Alloc in DSP Path | Zero | Per-buffer (managed) | Minimal | Minimal |
 | Inter-block Overhead | None (comptime chain) | Significant (scheduler) | Low (linear path) | Low (worker threads) |
@@ -252,6 +281,10 @@ rf-fun has a focused, deep feature set in its niche (HackRF spectrum analysis + 
 - Simple FM receiver: handles 20+ Msps on modern hardware
 - Complex graphs: CPU-bound at lower rates due to scheduler overhead
 - VOLK-accelerated blocks approach theoretical hardware limits
+- Typical latency: 10-50 ms (optimized), ~37 ms (USRP1 USB 2.0), hundreds of ms (untuned)
+- Known issue: latency drift -- flowgraphs starting at ~1s degrade to tens of seconds over hours
+- Real-time scheduling priority gives ~50% speedup but thread migrations thrash L1 cache
+- Qt GUI sinks are CPU-heavy: two sinks at once can be unusable on a 2.4 GHz quad-core
 
 **rf-fun:**
 - No published benchmarks yet
@@ -308,13 +341,16 @@ rf-fun's architecture is designed for minimal overhead and should perform well f
 | Metric | rf-fun | GNU Radio | SDR++ | SigDigger |
 |---|---|---|---|---|
 | Age | Months | 20+ years | ~5 years | ~5 years |
-| Contributors | 1 (+ AI) | 300+ | 1 primary + community | 1 primary + few |
-| GitHub Stars | Private | ~5,500 | ~5,700 | ~1,500 |
-| Ecosystem Size | Self-contained | 100+ OOT modules | ~10 third-party modules | ~5 plugins |
+| Contributors | 1 (+ AI) | 362 | 1 primary + community | 1 primary + few |
+| GitHub Stars | Private | ~6,000 | ~5,700 | ~1,500 |
+| Forks | N/A | ~2,100 | ~780 | ~137 |
+| Total Commits | Low hundreds | 15,900+ | ~1,764 | ~1,000+ est. |
+| Ecosystem Size | Self-contained | 150+ OOT modules (CGRAN) | ~10 third-party modules | ~5 plugins |
 | Documentation | Minimal | Extensive (wiki, tutorials, books) | User guide PDF, CE dev docs | User manual, FOSDEM talks |
 | Academic Use | None | Standard in university curricula | Minimal | Minimal |
-| Industry Use | None | Defense, telecom, research labs | Hobbyist | Research / reverse engineering |
-| Support Channels | None | Mailing list, IRC, Discourse | GitHub issues | GitHub issues |
+| Industry Use | None | Defense, telecom, research, nuclear physics, space missions | Hobbyist | Research / reverse engineering |
+| Support Channels | None | Mailing list, IRC/Matrix, annual GRCon conference, GSoC | GitHub issues | GitHub issues |
+| Distribution | Source only | RadioConda, distro packages, source | Nightly builds, AUR | AppImage, .dmg, .exe |
 
 ### Maturity Assessment
 
@@ -363,8 +399,9 @@ rf-fun's architecture is designed for minimal overhead and should perform well f
 ## 7. Roadmap Comparison
 
 ### GNU Radio
-- **GNU Radio 4.0** (in development): Complete rewrite with compile-time graph construction, better performance, modern C++20. Aims to address the scheduler overhead problem that rf-fun's architecture already solves.
-- Risk: GR 4.0 has been in progress for years; the transition will fragment the ecosystem.
+- **GNU Radio 4.0** (beta, no release date): Complete rewrite in C++23. Header-only, lock-free buffers, compile-time type checking, modular schedulers, `processOne()` API, heterogeneous CPU/GPU/FPGA scheduling (SYCL/CUDA prototypes). MIT licensed core. Can produce 2-3 MB standalone executables. Forked from `fair-acc/gnuradio4` (GSI-FAIR particle accelerator research). GSoC 2025 expanded Math, Analog, and Digital block sets.
+- **Implication for rf-fun:** GR4 is directly competing in the same "compile-time optimized DSP" space. However, GR4 is still beta, C++23 is far more complex than Zig, and the 3.x-to-4.0 transition will fragment the GNU Radio ecosystem. The window of opportunity is now.
+- Risk: GR 4.0 has been in progress for years; the transition will fragment the ecosystem. But if it ships successfully, it closes rf-fun's performance advantage over GNU Radio.
 
 ### SDR++
 - No formal roadmap. Rolling nightly releases.

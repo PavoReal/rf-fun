@@ -17,6 +17,8 @@ const radio_decoder_mod = @import("radio_decoder.zig");
 const RadioDecoder = radio_decoder_mod.RadioDecoder;
 const ModulationType = radio_decoder_mod.ModulationType;
 const GuiState = @import("gui_state.zig").GuiState;
+const wav_reader = @import("wav_reader.zig");
+const FileSource = @import("file_source.zig").FileSource;
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -257,6 +259,44 @@ fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
     zgui.dockBuilderFinish(dockspace_id);
 }
 
+const FileDialogState = struct {
+    path_buf: [1024]u8 = std.mem.zeroes([1024]u8),
+    path_len: usize = 0,
+    pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn dialogCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+        const self: *FileDialogState = @ptrCast(@alignCast(userdata));
+
+        if (filelist == null or filelist[0] == null) {
+            self.pending.store(false, .release);
+            return;
+        }
+
+        const selected = std.mem.span(filelist[0]);
+        const copy_len = @min(selected.len, self.path_buf.len - 1);
+        @memcpy(self.path_buf[0..copy_len], selected[0..copy_len]);
+        self.path_buf[copy_len] = 0;
+        self.path_len = copy_len;
+
+        self.ready.store(true, .release);
+        self.pending.store(false, .release);
+    }
+};
+
+fn ActiveSource(comptime T: type) type {
+    return struct {
+        mutex: *std.Thread.Mutex,
+        buffer: *FixedSizeRingBuffer(T),
+    };
+}
+
+fn getActiveSource(sdr_ptr: ?*SDR, file_src_ptr: ?*FileSource) ?ActiveSource(hackrf.IQSample) {
+    if (sdr_ptr) |s| return .{ .mutex = &s.mutex, .buffer = &s.rx_buffer };
+    if (file_src_ptr) |f| return .{ .mutex = &f.mutex, .buffer = &f.rx_buffer };
+    return null;
+}
+
 pub fn main() !void {
     var allocator: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(allocator.deinit() == .ok);
@@ -264,6 +304,10 @@ pub fn main() !void {
     const alloc = allocator.allocator();
 
     var sdr: ?SDR = null;
+    var file_src: ?FileSource = null;
+    var file_samples: ?[]hackrf.IQSample = null;
+    var file_cf_mhz: f32 = 100.0;
+    var file_dialog: FileDialogState = .{};
     var show_no_device_popup: bool = false;
 
     try zsdl.init(.{ .video = true, .events = true, .audio = true });
@@ -370,7 +414,7 @@ pub fn main() !void {
             }
         }
 
-        if (sdr != null) {
+        if (sdr != null or file_src != null) {
             _ = analyzer.pollFrame();
         }
 
@@ -420,13 +464,16 @@ pub fn main() !void {
             {
                 config.render(if (sdr != null) sdr.?.device else null);
 
-                save_mgr.render(
-                    if (sdr != null) &sdr.?.mutex else null,
-                    if (sdr != null) &sdr.?.rx_buffer else null,
-                    &config,
-                    alloc,
-                    @ptrCast(window),
-                );
+                {
+                    const active = getActiveSource(if (sdr != null) &sdr.? else null, if (file_src != null) &file_src.? else null);
+                    save_mgr.render(
+                        if (active) |a| a.mutex else null,
+                        if (active) |a| a.buffer else null,
+                        &config,
+                        alloc,
+                        @ptrCast(window),
+                    );
+                }
 
                 if (config.connect_requested) {
                     config.connect_requested = false;
@@ -455,11 +502,41 @@ pub fn main() !void {
                     }
                 }
 
+                if (file_dialog.ready.load(.acquire)) {
+                    file_dialog.ready.store(false, .release);
+                    const path = file_dialog.path_buf[0..file_dialog.path_len];
+                    if (wav_reader.readWav(path, alloc)) |result| {
+                        if (file_src != null) {
+                            radio_decoder.stop();
+                            analyzer.stopThread();
+                            file_src.?.deinit(alloc);
+                            file_src = null;
+                        }
+                        if (file_samples) |fs| alloc.free(fs);
+                        file_samples = result.samples;
+                        file_cf_mhz = config.cf_mhz;
+
+                        const sr: f64 = @floatFromInt(result.info.sample_rate);
+                        config.cf_mhz = file_cf_mhz;
+
+                        file_src = FileSource.init(alloc, result.samples, result.info.sample_rate, config.rxBufSamples()) catch null;
+                        if (file_src != null) {
+                            file_src.?.start() catch {};
+                            analyzer.updateFreqs(file_cf_mhz, sr);
+                            radio_decoder.updateFreqs(file_cf_mhz, sr);
+                            analyzer.startThread(&file_src.?.mutex, &file_src.?.rx_buffer) catch {};
+                            radio_decoder.start(&file_src.?.mutex, &file_src.?.rx_buffer) catch {};
+                            show_no_device_popup = false;
+                            zgui.closeCurrentPopup();
+                        }
+                    } else |_| {}
+                }
+
                 if (show_no_device_popup) {
                     const vp = zgui.getMainViewport();
                     const vp_size = vp.getSize();
-                    zgui.setNextWindowPos(.{ .x = vp_size[0] / 2.0 - 150.0, .y = vp_size[1] / 2.0 - 60.0 });
-                    zgui.setNextWindowSize(.{ .w = 300, .h = 120 });
+                    zgui.setNextWindowPos(.{ .x = vp_size[0] / 2.0 - 175.0, .y = vp_size[1] / 2.0 - 60.0 });
+                    zgui.setNextWindowSize(.{ .w = 350, .h = 140 });
 
                     if (zgui.beginPopupModal("No Device", .{ .flags = .{ .no_resize = true, .no_move = true } })) {
                         zgui.text("No HackRF device detected.", .{});
@@ -470,6 +547,20 @@ pub fn main() !void {
                         if (zgui.button("Scan for device", .{})) {
                             config.connect_requested = true;
                             zgui.closeCurrentPopup();
+                        }
+                        zgui.sameLine(.{});
+                        {
+                            const load_disabled = file_dialog.pending.load(.acquire);
+                            if (load_disabled) zgui.beginDisabled(.{});
+                            if (zgui.button("Load I/Q File", .{})) {
+                                file_dialog.pending.store(true, .release);
+                                const filter = c.SDL_DialogFileFilter{
+                                    .name = "WAV files",
+                                    .pattern = "wav",
+                                };
+                                c.SDL_ShowOpenFileDialog(FileDialogState.dialogCallback, &file_dialog, @ptrCast(window), &filter, 1, null, false);
+                            }
+                            if (load_disabled) zgui.endDisabled();
                         }
                         zgui.sameLine(.{});
                         if (zgui.button("Exit", .{})) {
@@ -483,10 +574,20 @@ pub fn main() !void {
                     config.disconnect_requested = false;
                     radio_decoder.stop();
                     analyzer.stopThread();
-                    sdr.?.rx_running = false;
-                    try sdr.?.deinit(alloc);
-                    sdr = null;
-                    config.clearDeviceInfo();
+                    if (sdr != null) {
+                        sdr.?.rx_running = false;
+                        try sdr.?.deinit(alloc);
+                        sdr = null;
+                        config.clearDeviceInfo();
+                    }
+                    if (file_src != null) {
+                        file_src.?.deinit(alloc);
+                        file_src = null;
+                        if (file_samples) |fs| {
+                            alloc.free(fs);
+                            file_samples = null;
+                        }
+                    }
                     config.connect_error_msg = null;
                     analyzer.resetAll();
                 }
@@ -557,22 +658,26 @@ pub fn main() !void {
                     },
                 };
 
-                const buf_snap: BufferSnapshot = if (sdr != null) blk: {
-                    sdr.?.mutex.lock();
-                    defer sdr.?.mutex.unlock();
-                    break :blk .{
-                        .count = sdr.?.rx_buffer.count,
-                        .capacity = sdr.?.rx_buffer.buf.len,
-                        .total_written = sdr.?.rx_buffer.total_written,
-                        .rx_bytes = sdr.?.rx_bytes_received,
-                    };
-                } else .{};
+                const buf_snap: BufferSnapshot = blk: {
+                    const active = getActiveSource(if (sdr != null) &sdr.? else null, if (file_src != null) &file_src.? else null);
+                    if (active) |a| {
+                        a.mutex.lock();
+                        defer a.mutex.unlock();
+                        break :blk .{
+                            .count = a.buffer.count,
+                            .capacity = a.buffer.buf.len,
+                            .total_written = a.buffer.total_written,
+                            .rx_bytes = if (sdr != null) sdr.?.rx_bytes_received else 0,
+                        };
+                    }
+                    break :blk .{};
+                };
 
                 const sys = SystemSnapshot{
                     .fps = zgui.io.getFramerate(),
                     .buf = buf_snap,
                     .sample_rate = config.fsHz(),
-                    .sdr_connected = sdr != null,
+                    .sdr_connected = sdr != null or file_src != null,
                     .radio_enabled = radio_decoder.ui_enabled,
                     .squelch_open = radio_decoder.worker.squelch_open_atomic.load(.acquire) != 0,
                     .audio_underruns = radio_decoder.audioUnderruns(),
@@ -585,6 +690,8 @@ pub fn main() !void {
                     wf_gpu.resize(ui_result.new_fft_size, 256);
                     if (sdr != null) {
                         try analyzer.startThread(&sdr.?.mutex, &sdr.?.rx_buffer);
+                    } else if (file_src != null) {
+                        try analyzer.startThread(&file_src.?.mutex, &file_src.?.rx_buffer);
                     }
                 }
 
@@ -762,10 +869,17 @@ pub fn main() !void {
         }
     }
 
+    radio_decoder.stop();
+    analyzer.stopThread();
     if (sdr != null) {
-        radio_decoder.stop();
-        analyzer.stopThread();
         sdr.?.rx_running = false;
         try sdr.?.deinit(alloc);
+    }
+    if (file_src != null) {
+        file_src.?.deinit(alloc);
+        file_src = null;
+    }
+    if (file_samples) |fs| {
+        alloc.free(fs);
     }
 }

@@ -3,6 +3,7 @@ const hackrf = @import("rf_fun");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const DecimatingFir = @import("dsp/decimating_fir.zig").DecimatingFir;
 const Nco = @import("dsp/nco.zig").Nco;
+const Agc = @import("dsp/agc.zig").Agc;
 const DeEmphasis = @import("dsp/deemphasis.zig").DeEmphasis;
 const DcFilter = @import("dsp/dc_filter.zig").DcFilter;
 const CtcssDetector = @import("dsp/ctcss_detector.zig").CtcssDetector;
@@ -22,12 +23,15 @@ pub const ModulationType = enum(u8) {
     fm = 0,
     am = 1,
     nfm = 2,
+    usb = 3,
+    lsb = 4,
 
     pub fn intermediateRate(self: ModulationType) f32 {
         return switch (self) {
             .fm => 400_000.0,
             .am => 32_000.0,
             .nfm => 50_000.0,
+            .usb, .lsb => 16_000.0,
         };
     }
 
@@ -36,6 +40,7 @@ pub const ModulationType = enum(u8) {
             .fm => 50_000.0,
             .am => 16_000.0,
             .nfm => 25_000.0,
+            .usb, .lsb => 8_000.0,
         };
     }
 
@@ -44,6 +49,7 @@ pub const ModulationType = enum(u8) {
             .fm => 8,
             .am => 2,
             .nfm => 2,
+            .usb, .lsb => 2,
         };
     }
 
@@ -56,6 +62,7 @@ pub const ModulationType = enum(u8) {
             .fm => 75e-6,
             .am => 0.0,
             .nfm => 750e-6,
+            .usb, .lsb => 0.0,
         };
     }
 
@@ -64,6 +71,7 @@ pub const ModulationType = enum(u8) {
             .fm => 75_000.0,
             .nfm => 2_500.0,
             .am => 1.0,
+            .usb, .lsb => 1.0,
         };
         return self.intermediateRate() / (2.0 * std.math.pi * max_deviation);
     }
@@ -122,6 +130,9 @@ pub const DecoderWorker = struct {
     stage1_capacity: usize,
     stage2_capacity: usize,
 
+    ssb_nco: ?Nco,
+    agc: ?Agc,
+
     ctcss: ?CtcssDetector,
     dcs: ?DcsDetector,
     noise_squelch: ?NoiseSquelch,
@@ -166,6 +177,7 @@ pub const DecoderWorker = struct {
             .fm => intermediate_rate * 0.45,
             .am => 5000.0,
             .nfm => 6250.0,
+            .usb, .lsb => 3200.0,
         };
 
         var stage1_fir = try DecimatingFir([2]f32).init(alloc, computeTapCount(stage1_r), stage1_cutoff, sr, stage1_r);
@@ -207,6 +219,8 @@ pub const DecoderWorker = struct {
             .input_capacity = input_cap,
             .stage1_capacity = stage1_cap,
             .stage2_capacity = stage2_cap,
+            .ssb_nco = if (modulation == .usb) Nco.init(1500.0, @as(f64, intermediate_rate)) else if (modulation == .lsb) Nco.init(-1500.0, @as(f64, intermediate_rate)) else null,
+            .agc = if (modulation == .usb or modulation == .lsb) Agc.init(audio_rate) else null,
             .ctcss = if (modulation == .nfm) CtcssDetector.init(audio_rate) else null,
             .dcs = if (modulation == .nfm) DcsDetector.init(audio_rate) else null,
             .noise_squelch = if (modulation == .nfm) NoiseSquelch.init(audio_rate) else null,
@@ -253,6 +267,15 @@ pub const DecoderWorker = struct {
                 self.envelopeDetect(self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]);
                 _ = self.dc_block.process(self.discrim_buf[0..s1_count], self.discrim_buf[0..s1_count]);
             },
+            .usb, .lsb => {
+                if (self.ssb_nco) |*nco| {
+                    _ = nco.process(self.stage1_buf[0..s1_count], self.stage1_buf[0..s1_count]);
+                }
+                for (self.stage1_buf[0..s1_count], self.discrim_buf[0..s1_count]) |sample, *out| {
+                    out.* = sample[0];
+                }
+                _ = self.dc_block.process(self.discrim_buf[0..s1_count], self.discrim_buf[0..s1_count]);
+            },
         }
         const t3: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.demodulate, t3 - t2);
@@ -265,6 +288,12 @@ pub const DecoderWorker = struct {
         switch (self.modulation) {
             .fm, .nfm => _ = self.deemphasis.process(self.stage2_buf[0..s2_count], self.audio_buf[0..s2_count]),
             .am => @memcpy(self.audio_buf[0..s2_count], self.stage2_buf[0..s2_count]),
+            .usb, .lsb => {
+                @memcpy(self.audio_buf[0..s2_count], self.stage2_buf[0..s2_count]);
+                if (self.agc) |*agc| {
+                    _ = agc.process(self.audio_buf[0..s2_count], self.audio_buf[0..s2_count]);
+                }
+            },
         }
         const t5: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.deemphasis, t5 - t4);
@@ -463,6 +492,7 @@ pub const DecoderWorker = struct {
             .fm => intermediate_rate * 0.45,
             .am => 5000.0,
             .nfm => 6250.0,
+            .usb, .lsb => 3200.0,
         };
 
         self.stage1_fir.deinit(self.alloc);
@@ -497,6 +527,8 @@ pub const DecoderWorker = struct {
         self.noise_squelch = if (modulation == .nfm) NoiseSquelch.init(audio_rate) else null;
         self.tone_squelch_state = if (modulation == .nfm) ToneSquelch.init(audio_rate) else null;
         self.ctcss_hpf = if (modulation == .nfm) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null;
+        self.ssb_nco = if (modulation == .usb) Nco.init(1500.0, @as(f64, intermediate_rate)) else if (modulation == .lsb) Nco.init(-1500.0, @as(f64, intermediate_rate)) else null;
+        self.agc = if (modulation == .usb or modulation == .lsb) Agc.init(audio_rate) else null;
     }
 
     pub fn reset(self: *Self) void {
@@ -511,6 +543,8 @@ pub const DecoderWorker = struct {
         if (self.noise_squelch) |*sq| sq.reset();
         if (self.tone_squelch_state) |*tsq| tsq.reset();
         if (self.ctcss_hpf) |*hpf| hpf.reset();
+        if (self.ssb_nco) |*nco| nco.reset();
+        if (self.agc) |*agc| agc.reset();
     }
 
     fn computeStage1Decimation(sample_rate: f32, intermediate_rate: f32) usize {
@@ -867,7 +901,7 @@ pub const RadioDecoder = struct {
 
         zgui.separatorText("Modulation");
 
-        const mod_labels: [:0]const u8 = "FM\x00AM\x00NFM\x00";
+        const mod_labels: [:0]const u8 = "FM\x00AM\x00NFM\x00USB\x00LSB\x00";
         if (zgui.combo("Mode", .{
             .current_item = &self.ui_modulation_index,
             .items_separated_by_zeros = mod_labels,
@@ -1013,6 +1047,8 @@ pub const RadioDecoder = struct {
                 .fm => "Decoding FM",
                 .am => "Decoding AM",
                 .nfm => "Decoding NFM",
+                .usb => "Decoding USB",
+                .lsb => "Decoding LSB",
             };
             zgui.textColored(.{ 0.2, 1.0, 0.2, 1.0 }, "{s}", .{label});
         } else {

@@ -671,7 +671,40 @@ pub fn main() !void {
                         const plot_left_local = plot_result.plot_pos[0] - window_pos[0];
                         const waterfall_width = plot_result.plot_size[0];
                         zgui.setCursorPosX(plot_left_local);
+                        const wf_screen_pos = zgui.getCursorScreenPos();
                         zgui.image(tex_ref, .{ .w = waterfall_width, .h = wf_h });
+
+                        if (radio_decoder.ui_enabled) {
+                            const x_range = plot_result.limits.x_max - plot_result.limits.x_min;
+                            if (x_range > 0) {
+                                const t: f32 = @floatCast((drag_freq - plot_result.limits.x_min) / x_range);
+                                if (t >= 0.0 and t <= 1.0) {
+                                    const line_x = wf_screen_pos[0] + t * waterfall_width;
+                                    const wf_top = wf_screen_pos[1];
+                                    const wf_bot = wf_top + wf_h;
+                                    const draw_list = zgui.getWindowDrawList();
+
+                                    if (decode_band) |b| {
+                                        const t_lo: f32 = @floatCast(((b.center - b.half_width) - plot_result.limits.x_min) / x_range);
+                                        const t_hi: f32 = @floatCast(((b.center + b.half_width) - plot_result.limits.x_min) / x_range);
+                                        const band_x0 = wf_screen_pos[0] + @max(0.0, t_lo) * waterfall_width;
+                                        const band_x1 = wf_screen_pos[0] + @min(1.0, t_hi) * waterfall_width;
+                                        draw_list.addRectFilled(.{
+                                            .pmin = .{ band_x0, wf_top },
+                                            .pmax = .{ band_x1, wf_bot },
+                                            .col = 0x30_FF_00_FF,
+                                        });
+                                    }
+
+                                    draw_list.addLine(.{
+                                        .p1 = .{ line_x, wf_top },
+                                        .p2 = .{ line_x, wf_bot },
+                                        .col = 0xE6_FF_00_FF,
+                                        .thickness = 2.0,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 zgui.end();

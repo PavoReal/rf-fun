@@ -24,6 +24,7 @@ pub const NoiseSquelch = struct {
     auto_mode: bool = false,
     noise_floor_ema: f32 = 0.0,
     floor_tc_samples: f32,
+    floor_rise_tc_samples: f32,
     floor_initialized: bool = false,
     auto_margin: f32 = 0.7,
 
@@ -35,6 +36,7 @@ pub const NoiseSquelch = struct {
             .ramp_samples = @intFromFloat(0.005 * sample_rate),
             .ema_tc_samples = 0.200 * sample_rate,
             .floor_tc_samples = 2.0 * sample_rate,
+            .floor_rise_tc_samples = 8.0 * sample_rate,
         };
     }
 
@@ -82,6 +84,9 @@ pub const NoiseSquelch = struct {
             } else if (self.state == .closed) {
                 const floor_alpha = 1.0 - @exp(-@as(f32, @floatFromInt(noise_input.len)) / self.floor_tc_samples);
                 self.noise_floor_ema += floor_alpha * (rms - self.noise_floor_ema);
+            } else if (rms > self.noise_floor_ema) {
+                const rise_alpha = 1.0 - @exp(-@as(f32, @floatFromInt(noise_input.len)) / self.floor_rise_tc_samples);
+                self.noise_floor_ema += rise_alpha * (rms - self.noise_floor_ema);
             }
 
             self.close_threshold = self.noise_floor_ema * self.auto_margin;
@@ -387,7 +392,7 @@ test "auto mode closes squelch on noise-only signal" {
     try testing.expect(!sq.isOpen());
 }
 
-test "auto mode floor only updates when closed" {
+test "auto mode floor does not fall when open" {
     var sq = NoiseSquelch.init(25000.0);
     sq.setAutoMode(true);
 
@@ -410,9 +415,43 @@ test "auto mode floor only updates when closed" {
         const t: f32 = @floatFromInt(i);
         s.* = 0.01 * @sin(2.0 * std.math.pi * 8000.0 * t / 25000.0);
     }
-    sq.measureAndGate(&noise_input, &audio);
+    for (0..10) |_| {
+        sq.measureAndGate(&noise_input, &audio);
+        sq.state = .open;
+    }
 
     try testing.expectApproxEqAbs(floor_before, sq.noise_floor_ema, 0.001);
+}
+
+test "auto mode floor tracks rising noise when open" {
+    var sq = NoiseSquelch.init(25000.0);
+    sq.setAutoMode(true);
+
+    var noise_input: [2000]f32 = undefined;
+    var audio: [2000]f32 = undefined;
+
+    for (&noise_input, 0..) |*s, i| {
+        const t: f32 = @floatFromInt(i);
+        s.* = 0.3 * @sin(2.0 * std.math.pi * 8000.0 * t / 25000.0);
+    }
+    @memset(&audio, 0.5);
+
+    for (0..50) |_| {
+        sq.measureAndGate(&noise_input, &audio);
+    }
+    const floor_before = sq.noise_floor_ema;
+
+    sq.state = .open;
+    for (&noise_input, 0..) |*s, i| {
+        const t: f32 = @floatFromInt(i);
+        s.* = 0.9 * @sin(2.0 * std.math.pi * 8000.0 * t / 25000.0);
+    }
+    for (0..100) |_| {
+        sq.measureAndGate(&noise_input, &audio);
+        sq.state = .open;
+    }
+
+    try testing.expect(sq.noise_floor_ema > floor_before);
 }
 
 test "setAutoMode resets floor tracker" {

@@ -26,12 +26,22 @@ pub const ModulationType = enum(u8) {
     fm = 0,
     am = 1,
     nfm = 2,
+    usb = 3,
+    lsb = 4,
+    dsb = 5,
+    cw = 6,
+    raw = 7,
 
     pub fn profile(self: ModulationType) demod.DemodProfile {
         return switch (self) {
             .fm => demod.fm_profile,
             .am => demod.am_profile,
             .nfm => demod.nfm_profile,
+            .usb => demod.usb_profile,
+            .lsb => demod.lsb_profile,
+            .dsb => demod.dsb_profile,
+            .cw => demod.cw_profile,
+            .raw => demod.raw_profile,
         };
     }
 
@@ -97,6 +107,7 @@ pub const DecoderWorker = struct {
     modulation: ModulationType,
 
     nco: Nco,
+    product_nco: Nco,
     stage1_fir: DecimatingFir([2]f32),
     stage2_fir: DecimatingFir(f32),
     deemphasis: DeEmphasis,
@@ -148,7 +159,7 @@ pub const DecoderWorker = struct {
     timing_ema: ps.EmaAccumulator(RadioStageId) = ps.EmaAccumulator(RadioStageId).init(0.1),
     pipeline_stats: ps.PipelineStats(RadioStageId) = .{},
 
-    pub fn init(alloc: std.mem.Allocator, sample_rate: f64, freq_offset: f64, tau: f32, modulation: ModulationType, nfm_dev: f32) !Self {
+    pub fn init(alloc: std.mem.Allocator, sample_rate: f64, freq_offset: f64, tau: f32, modulation: ModulationType, nfm_dev: f32, cw_tone: f32) !Self {
         const sr: f32 = @floatCast(sample_rate);
         const intermediate_rate = modulation.intermediateRate();
         const audio_rate = modulation.audioRate();
@@ -198,6 +209,10 @@ pub const DecoderWorker = struct {
             .alloc = alloc,
             .modulation = modulation,
             .nco = Nco.init(freq_offset, sample_rate),
+            .product_nco = blk: {
+                const product_offset: f32 = if (modulation == .cw) cw_tone else p.product_offset_hz;
+                break :blk Nco.init(product_offset, intermediate_rate);
+            },
             .stage1_fir = stage1_fir,
             .stage2_fir = stage2_fir,
             .deemphasis = DeEmphasis.init(audio_rate, tau),
@@ -265,11 +280,23 @@ pub const DecoderWorker = struct {
                     _ = self.dc_block.process(self.discrim_buf[0..s1_count], self.discrim_buf[0..s1_count]);
                 }
             },
+            .product => {
+                _ = self.product_nco.process(self.stage1_buf[0..s1_count], self.nco_buf[0..s1_count]);
+                for (self.nco_buf[0..s1_count], self.discrim_buf[0..s1_count]) |cplx, *out| {
+                    out.* = cplx[0];
+                }
+                if (prof.uses_dc_block) {
+                    _ = self.dc_block.process(self.discrim_buf[0..s1_count], self.discrim_buf[0..s1_count]);
+                }
+            },
         }
         const t3: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.demodulate, t3 - t2);
 
-        const s2_count = self.stage2_fir.process(self.discrim_buf[0..s1_count], self.stage2_buf);
+        const s2_count = if (prof.stage2_decimation == 1) blk: {
+            @memcpy(self.stage2_buf[0..s1_count], self.discrim_buf[0..s1_count]);
+            break :blk s1_count;
+        } else self.stage2_fir.process(self.discrim_buf[0..s1_count], self.stage2_buf);
         if (s2_count == 0) return 0;
         const t4: u64 = @intCast(std.time.nanoTimestamp());
         self.timing_ema.update(.stage2_decimate, t4 - t3);
@@ -480,7 +507,7 @@ pub const DecoderWorker = struct {
         }
     }
 
-    pub fn reconfigure(self: *Self, sample_rate: f64, tau: f32, modulation: ModulationType, nfm_dev: f32) !void {
+    pub fn reconfigure(self: *Self, sample_rate: f64, tau: f32, modulation: ModulationType, nfm_dev: f32, cw_tone: f32) !void {
         const sr: f32 = @floatCast(sample_rate);
         const intermediate_rate = modulation.intermediateRate();
         const audio_rate = modulation.audioRate();
@@ -497,33 +524,72 @@ pub const DecoderWorker = struct {
             .nfm_adaptive => (nfm_dev + 3000.0) * 1.1,
         };
 
+        var new_stage1_fir = try DecimatingFir([2]f32).init(self.alloc, computeTapCount(stage1_r), stage1_cutoff, sr, stage1_r);
+        errdefer new_stage1_fir.deinit(self.alloc);
+
+        var new_stage2_fir = try DecimatingFir(f32).init(self.alloc, computeTapCount(s2_dec), audio_rate * 0.45, intermediate_rate, s2_dec);
+        errdefer new_stage2_fir.deinit(self.alloc);
+
+        var new_s1_buf: ?[][2]f32 = null;
+        var new_discrim: ?[]f32 = null;
+        errdefer {
+            if (new_s1_buf) |b| self.alloc.free(b);
+            if (new_discrim) |b| self.alloc.free(b);
+        }
+        if (new_stage1_cap > self.stage1_capacity) {
+            new_s1_buf = try self.alloc.alloc([2]f32, new_stage1_cap);
+            new_discrim = try self.alloc.alloc(f32, new_stage1_cap);
+        }
+
+        var new_s2_buf: ?[]f32 = null;
+        var new_audio: ?[]f32 = null;
+        var new_delayed: ?[]f32 = null;
+        errdefer {
+            if (new_s2_buf) |b| self.alloc.free(b);
+            if (new_audio) |b| self.alloc.free(b);
+            if (new_delayed) |b| self.alloc.free(b);
+        }
+        if (new_stage2_cap > self.stage2_capacity) {
+            new_s2_buf = try self.alloc.alloc(f32, new_stage2_cap);
+            new_audio = try self.alloc.alloc(f32, new_stage2_cap);
+            new_delayed = try self.alloc.alloc(f32, new_stage2_cap);
+        }
+
+        const delay_samples: usize = @intFromFloat(0.020 * audio_rate);
+        const new_audio_delay = try DelayLine.init(self.alloc, delay_samples);
+
         self.stage1_fir.deinit(self.alloc);
-        self.stage1_fir = try DecimatingFir([2]f32).init(self.alloc, computeTapCount(stage1_r), stage1_cutoff, sr, stage1_r);
+        self.stage1_fir = new_stage1_fir;
 
         self.stage2_fir.deinit(self.alloc);
-        self.stage2_fir = try DecimatingFir(f32).init(self.alloc, computeTapCount(s2_dec), audio_rate * 0.45, intermediate_rate, s2_dec);
+        self.stage2_fir = new_stage2_fir;
 
-        if (new_stage1_cap > self.stage1_capacity) {
+        if (new_s1_buf) |buf| {
             self.alloc.free(self.stage1_buf);
-            self.stage1_buf = try self.alloc.alloc([2]f32, new_stage1_cap);
+            self.stage1_buf = buf;
+        }
+        if (new_discrim) |buf| {
             self.alloc.free(self.discrim_buf);
-            self.discrim_buf = try self.alloc.alloc(f32, new_stage1_cap);
+            self.discrim_buf = buf;
         }
         self.stage1_capacity = new_stage1_cap;
 
-        if (new_stage2_cap > self.stage2_capacity) {
+        if (new_s2_buf) |buf| {
             self.alloc.free(self.stage2_buf);
-            self.stage2_buf = try self.alloc.alloc(f32, new_stage2_cap);
+            self.stage2_buf = buf;
+        }
+        if (new_audio) |buf| {
             self.alloc.free(self.audio_buf);
-            self.audio_buf = try self.alloc.alloc(f32, new_stage2_cap);
+            self.audio_buf = buf;
+        }
+        if (new_delayed) |buf| {
             self.alloc.free(self.delayed_audio_buf);
-            self.delayed_audio_buf = try self.alloc.alloc(f32, new_stage2_cap);
+            self.delayed_audio_buf = buf;
         }
         self.stage2_capacity = new_stage2_cap;
 
         self.audio_delay.deinit(self.alloc);
-        const delay_samples: usize = @intFromFloat(0.020 * audio_rate);
-        self.audio_delay = try DelayLine.init(self.alloc, delay_samples);
+        self.audio_delay = new_audio_delay;
 
         self.modulation = modulation;
         self.deviation_gain = modulation.deviationGain(nfm_dev);
@@ -537,10 +603,14 @@ pub const DecoderWorker = struct {
         self.squelch = Squelch.init(intermediate_rate, audio_rate);
         self.tone_squelch_state = if (p.has_tone_detection) ToneSquelch.init(audio_rate) else null;
         self.ctcss_hpf = if (p.has_tone_detection) Biquad.initHighPass(audio_rate, 300.0, 0.707) else null;
+
+        const product_offset: f32 = if (modulation == .cw) cw_tone else p.product_offset_hz;
+        self.product_nco = Nco.init(product_offset, intermediate_rate);
     }
 
     pub fn reset(self: *Self) void {
         self.nco.reset();
+        self.product_nco.reset();
         self.stage1_fir.reset();
         self.stage2_fir.reset();
         self.deemphasis.reset();
@@ -582,6 +652,7 @@ pub const RadioDecoder = struct {
     modulation: std.atomic.Value(u8) = .init(0),
     squelch_threshold: std.atomic.Value(u32) = .init(@bitCast(@as(f32, -100.0))),
     nfm_deviation: std.atomic.Value(u32) = .init(@bitCast(@as(f32, 5_000.0))),
+    cw_tone: std.atomic.Value(u32) = .init(@bitCast(@as(f32, 800.0))),
 
     reconfigure_flag: std.atomic.Value(bool) = .init(false),
     retune_center_requested: std.atomic.Value(u64) = .init(0),
@@ -614,6 +685,7 @@ pub const RadioDecoder = struct {
     ui_scan_require_tone: bool = false,
     ui_show_activity_log: bool = false,
     ui_deviation_index: i32 = 1,
+    ui_cw_tone: f32 = 800.0,
 
     pub fn init(alloc: std.mem.Allocator, sample_rate: f64, center_freq_mhz: f32) !Self {
         const cf: f64 = @floatCast(center_freq_mhz);
@@ -621,7 +693,7 @@ pub const RadioDecoder = struct {
         const default_freq: f64 = std.math.clamp(98.1, cf - half_bw, cf + half_bw);
         const offset = (default_freq - cf) * 1e6;
 
-        var worker = try DecoderWorker.init(alloc, sample_rate, offset, 75e-6, .fm, 5_000.0);
+        var worker = try DecoderWorker.init(alloc, sample_rate, offset, 75e-6, .fm, 5_000.0, 800.0);
         errdefer worker.deinit();
 
         const buf_size: usize = 262144;
@@ -697,8 +769,10 @@ pub const RadioDecoder = struct {
         self.ui_scan_require_tone = gs.radio_scan_require_tone;
         self.ui_show_activity_log = gs.radio_show_activity_log;
         self.ui_deviation_index = gs.radio_deviation_index;
+        self.ui_cw_tone = gs.radio_cw_tone;
 
         self.volume.store(@bitCast(self.ui_volume), .release);
+        self.cw_tone.store(@bitCast(self.ui_cw_tone), .release);
         self.modulation.store(@intCast(self.ui_modulation_index), .release);
         self.squelch_threshold.store(@bitCast(self.ui_squelch_threshold), .release);
         self.target_interval_ns.store(1_000_000_000 / @as(u64, @intCast(@max(1, self.ui_dsp_rate))), .release);
@@ -775,7 +849,8 @@ pub const RadioDecoder = struct {
             if (self.reconfigure_flag.swap(false, .acquire) or mod_changed) {
                 const tau: f32 = @bitCast(self.tau.load(.acquire));
                 const nfm_dev: f32 = @bitCast(self.nfm_deviation.load(.acquire));
-                self.worker.reconfigure(self.sample_rate, tau, new_mod, nfm_dev) catch {
+                const cw_t: f32 = @bitCast(self.cw_tone.load(.acquire));
+                self.worker.reconfigure(self.sample_rate, tau, new_mod, nfm_dev, cw_t) catch {
                     std.Thread.sleep(10 * std.time.ns_per_ms);
                     continue;
                 };
@@ -796,6 +871,11 @@ pub const RadioDecoder = struct {
             const freq_mhz: f64 = @bitCast(self.freq_mhz.load(.acquire));
             const offset = (freq_mhz - @as(f64, @floatCast(self.center_freq_mhz))) * 1e6;
             self.worker.nco.setFrequency(offset, self.sample_rate);
+
+            if (new_mod == .cw) {
+                const cw_t: f32 = @bitCast(self.cw_tone.load(.acquire));
+                self.worker.product_nco.setFrequency(cw_t, new_mod.intermediateRate());
+            }
 
             const squelch_thresh: f32 = @bitCast(self.squelch_threshold.load(.acquire));
             self.worker.squelch_threshold = squelch_thresh;
@@ -966,6 +1046,17 @@ pub const RadioDecoder = struct {
             }
         }
 
+        if (self.ui_modulation_index == 6) {
+            if (zgui.sliderFloat("CW Tone", .{
+                .v = &self.ui_cw_tone,
+                .min = 250.0,
+                .max = 1250.0,
+                .cfmt = "%.0f Hz",
+            })) {
+                self.cw_tone.store(@bitCast(self.ui_cw_tone), .release);
+            }
+        }
+
         zgui.separatorText("Squelch");
 
         if (zgui.sliderFloat("Threshold", .{
@@ -1066,6 +1157,11 @@ pub const RadioDecoder = struct {
                 .fm => "Decoding FM",
                 .am => "Decoding AM",
                 .nfm => "Decoding NFM",
+                .usb => "Decoding USB",
+                .lsb => "Decoding LSB",
+                .dsb => "Decoding DSB",
+                .cw => "Decoding CW",
+                .raw => "Decoding RAW",
             };
             zgui.textColored(.{ 0.2, 1.0, 0.2, 1.0 }, "{s}", .{label});
         } else {

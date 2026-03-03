@@ -24,6 +24,7 @@ pub const GuiState = struct {
     radio_scan_require_tone: bool = false,
     radio_show_activity_log: bool = false,
     radio_deviation_index: i32 = 1,
+    radio_cw_tone: f32 = 800.0,
 
     channel_master_volume: f32 = 1.0,
     channel_preset_index: i32 = 0,
@@ -99,6 +100,7 @@ pub const GuiState = struct {
         self.radio_scan_require_tone = decoder.ui_scan_require_tone;
         self.radio_show_activity_log = decoder.ui_show_activity_log;
         self.radio_deviation_index = decoder.ui_deviation_index;
+        self.radio_cw_tone = decoder.ui_cw_tone;
 
         self.stats_num_peaks = @intCast(stats.num_display_peaks);
     }

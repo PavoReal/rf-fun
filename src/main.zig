@@ -4,7 +4,9 @@ const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const plot = @import("plot.zig");
 const Waterfall = @import("waterfall.zig").Waterfall;
 const util = @import("util.zig");
-const HackRFConfig = @import("hackrf_config.zig").HackRFConfig;
+const hackrf_config = @import("hackrf_config.zig");
+const HackRFConfig = hackrf_config.HackRFConfig;
+const FreqWidget = @import("freq_widget.zig").FreqWidget;
 const SpectrumAnalyzer = @import("spectrum_analyzer.zig").SpectrumAnalyzer;
 const signal_stats = @import("signal_stats.zig");
 const SaveManager = @import("save_manager.zig").SaveManager;
@@ -20,6 +22,8 @@ const channel_manager_mod = @import("channel_manager.zig");
 const ChannelManager = channel_manager_mod.ChannelManager;
 const ChannelStripUi = @import("channel_strip_ui.zig").ChannelStripUi;
 const GuiState = @import("gui_state.zig").GuiState;
+const FreqReference = @import("freq_reference.zig").FreqReference;
+const freq_db = @import("freq_db.zig");
 const zsdl = @import("zsdl3");
 const zgui = @import("zgui");
 const c = @cImport({
@@ -257,12 +261,53 @@ fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
 
     zgui.dockBuilderDockWindow("###HackRF Config", left_top_id);
     zgui.dockBuilderDockWindow("###Save", left_top_id);
+    zgui.dockBuilderDockWindow("###Freq Ref", left_top_id);
     zgui.dockBuilderDockWindow("###Radio Decoder", left_bottom_id);
     zgui.dockBuilderDockWindow("###Channel Monitor", left_bottom_id);
     zgui.dockBuilderDockWindow("###Analysis", analysis_id);
     zgui.dockBuilderDockWindow("###Stats", stats_id);
     zgui.dockBuilderDockWindow("###Data View", bottom_id);
     zgui.dockBuilderFinish(dockspace_id);
+}
+
+fn renderTopBar(freq_widget: *FreqWidget, config: *HackRFConfig, sdr: ?SDR) void {
+    const bar_start = zgui.getCursorScreenPos();
+    const draw_list = zgui.getWindowDrawList();
+    const base = zgui.getStyle().font_size_base;
+    const label_h = base + 2.0;
+    const label_color: u32 = 0x99_FF_FF_FF;
+
+    const top_bar_scale: f32 = 2.0;
+    const scaled_base = base * top_bar_scale;
+
+    zgui.setCursorScreenPos(.{ bar_start[0], bar_start[1] + label_h });
+
+    zgui.pushFont(freq_widget.large_font, scaled_base);
+    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ 4.0 * top_bar_scale, 3.0 * top_bar_scale } });
+
+    const is_connected = sdr != null;
+    if (is_connected) {
+        if (zgui.button("Disconnect", .{})) config.disconnect_requested = true;
+    } else {
+        if (zgui.button("Connect", .{})) config.connect_requested = true;
+    }
+
+    if (config.connect_error_msg) |msg| {
+        zgui.sameLine(.{});
+        zgui.textColored(.{ 0.9, 0.1, 0.1, 1 }, "{s}", .{msg});
+    }
+
+    zgui.popStyleVar(.{});
+    zgui.popFont();
+
+    zgui.sameLine(.{ .spacing = 16 });
+
+    const freq_pos = zgui.getCursorScreenPos();
+    zgui.pushFont(freq_widget.large_font, scaled_base);
+    draw_list.addTextUnformatted(.{ freq_pos[0], bar_start[1] }, label_color, "Center Freq");
+    zgui.popFont();
+    freq_widget.render(config, if (sdr != null) sdr.?.device else null);
+
 }
 
 pub fn main() !void {
@@ -314,9 +359,18 @@ pub fn main() !void {
     });
     defer zgui.backend.deinit();
 
+    const large_font_config = blk: {
+        var fc = zgui.FontConfig.init();
+        fc.size_pixels = 64.0;
+        break :blk fc;
+    };
+    const large_font = zgui.io.addFontDefault(large_font_config);
+
     var config: HackRFConfig = .{};
     config.load();
     defer config.save();
+
+    var freq_widget = FreqWidget.init(config.cf_mhz, large_font);
 
     var gui_state: GuiState = .{};
     gui_state.load();
@@ -329,10 +383,13 @@ pub fn main() !void {
         else => {},
     }
     zgui.getStyle().font_size_base = gui_state.font_size;
+    zgui.getStyle().scaleAllSizes(1.3);
 
     config.connect_requested = true;
 
     var save_mgr: SaveManager = .{};
+    var freq_ref: FreqReference = .{};
+    freq_ref.loadPins();
 
     var analyzer = try SpectrumAnalyzer.init(alloc, gui_state.spec_fft_size_index, gui_state.spec_window_index, config.cf_mhz, config.fsHz(), 256);
     defer analyzer.deinit();
@@ -364,6 +421,7 @@ pub fn main() !void {
     stats_win.num_display_peaks = @intCast(@max(0, gui_state.stats_num_peaks));
 
     defer {
+        freq_ref.savePins();
         gui_state.collect(&analyzer, &radio_decoder, &stats_win);
         gui_state.channel_master_volume = channel_mgr.master_volume;
         gui_state.channel_preset_index = channel_strip_ui.preset_index;
@@ -376,6 +434,7 @@ pub fn main() !void {
     var drag_freq: f64 = radio_decoder.ui_freq_mhz;
     var last_retune_time_ms: u64 = 0;
     var dock_init_frames: u32 = 0;
+    var last_plot_limits: plot.PlotLimits = .{ .x_min = 0, .x_max = 0 };
 
     var running = true;
     while (running) {
@@ -385,6 +444,9 @@ pub fn main() !void {
                 _ = zgui.backend.processEvent(@ptrCast(&event));
                 if (event.type == .quit) {
                     running = false;
+                }
+                if (event.type == .mouse_wheel and freq_widget.widget_hovered) {
+                    freq_widget.feedScrollDelta(event.wheel.y);
                 }
             }
         }
@@ -422,6 +484,31 @@ pub fn main() !void {
 
             zgui.backend.newFrame(@intCast(win_w), @intCast(win_h), fb_scale);
 
+            const vp = zgui.getMainViewport();
+            const vp_pos = vp.getPos();
+            const vp_size = vp.getSize();
+            const top_bar_h = FreqWidget.getBarHeight();
+
+            zgui.setNextWindowPos(.{ .x = vp_pos[0], .y = vp_pos[1] });
+            zgui.setNextWindowSize(.{ .w = vp_size[0], .h = top_bar_h });
+            if (zgui.begin("##TopBar", .{ .flags = .{
+                .no_title_bar = true,
+                .no_resize = true,
+                .no_move = true,
+                .no_scrollbar = true,
+                .no_scroll_with_mouse = true,
+                .no_collapse = true,
+                .no_docking = true,
+                .no_saved_settings = true,
+                .no_bring_to_front_on_focus = true,
+            } })) {
+                renderTopBar(&freq_widget, &config, sdr);
+            }
+            zgui.end();
+
+            vp.work_pos[1] = vp_pos[1] + top_bar_h;
+            vp.work_size[1] = vp_size[1] - top_bar_h;
+
             const dockspace_id: zgui.Ident = 0xB00B1E5;
             if (dock_init_frames < 3) {
                 dock_init_frames += 1;
@@ -429,7 +516,7 @@ pub fn main() !void {
                     buildDefaultDockLayout(dockspace_id);
                 }
             }
-            _ = zgui.dockSpaceOverViewport(dockspace_id, zgui.getMainViewport(), .{ .passthru_central_node = true });
+            _ = zgui.dockSpaceOverViewport(dockspace_id, vp, .{ .passthru_central_node = true });
 
             if (config.reset_layout_requested) {
                 config.reset_layout_requested = false;
@@ -477,9 +564,9 @@ pub fn main() !void {
                 }
 
                 if (show_no_device_popup) {
-                    const vp = zgui.getMainViewport();
-                    const vp_size = vp.getSize();
-                    zgui.setNextWindowPos(.{ .x = vp_size[0] / 2.0 - 150.0, .y = vp_size[1] / 2.0 - 60.0 });
+                    const popup_vp = zgui.getMainViewport();
+                    const popup_vp_size = popup_vp.getSize();
+                    zgui.setNextWindowPos(.{ .x = popup_vp_size[0] / 2.0 - 150.0, .y = popup_vp_size[1] / 2.0 - 60.0 });
                     zgui.setNextWindowSize(.{ .w = 300, .h = 120 });
 
                     if (zgui.beginPopupModal("No Device", .{ .flags = .{ .no_resize = true, .no_move = true } })) {
@@ -561,6 +648,9 @@ pub fn main() !void {
 
                 radio_decoder.renderUi();
                 channel_strip_ui.render(&channel_mgr);
+                freq_ref.visible_x_min = last_plot_limits.x_min;
+                freq_ref.visible_x_max = last_plot_limits.x_max;
+                freq_ref.render(&radio_decoder);
 
                 if (@abs(drag_freq - radio_decoder.ui_freq_mhz) > 0.0001) {
                     drag_freq = radio_decoder.ui_freq_mhz;
@@ -680,7 +770,7 @@ pub fn main() !void {
                         marker_count = 1;
                     }
 
-                    var channel_bands: [channel_manager_mod.MAX_CHANNELS + 1]plot.BandX = undefined;
+                    var channel_bands: [channel_manager_mod.MAX_CHANNELS + freq_db.flat_entries.len + 2]plot.BandX = undefined;
                     var band_count: usize = 0;
 
                     if (radio_decoder.ui_enabled) {
@@ -694,6 +784,9 @@ pub fn main() !void {
                     }
 
                     if (channel_mgr.isEnabled()) {
+                        channel_mgr.channels_mutex.lock();
+                        defer channel_mgr.channels_mutex.unlock();
+
                         for (&channel_mgr.channels) |*slot| {
                             if (slot.*) |*ch| {
                                 if (!ch.enabled) continue;
@@ -708,6 +801,41 @@ pub fn main() !void {
                                 band_count += 1;
                             }
                         }
+                    }
+
+                    for (freq_db.flat_entries, 0..) |fe, i| {
+                        if (!freq_ref.pinned[i]) continue;
+                        const entry = fe.entry;
+                        var mode_color = entry.mode.color();
+                        mode_color[3] = 0.12;
+                        const center = (entry.freq_start_mhz + entry.freq_end_mhz) / 2.0;
+                        const half_w = (entry.freq_end_mhz - entry.freq_start_mhz) / 2.0;
+                        channel_bands[band_count] = .{
+                            .center = center,
+                            .half_width = if (half_w < 0.001) 0.005 else half_w,
+                            .color = mode_color,
+                        };
+                        const name_len = @min(entry.name.len, 16);
+                        @memcpy(channel_bands[band_count].label[0..name_len], entry.name[0..name_len]);
+                        channel_bands[band_count].label_len = @intCast(name_len);
+                        band_count += 1;
+                    }
+
+                    if (freq_ref.hovered_flat_idx) |hover_idx| {
+                        const entry = freq_db.flat_entries[hover_idx].entry;
+                        var hover_color = entry.mode.color();
+                        hover_color[3] = 0.25;
+                        const center = (entry.freq_start_mhz + entry.freq_end_mhz) / 2.0;
+                        const half_w = (entry.freq_end_mhz - entry.freq_start_mhz) / 2.0;
+                        channel_bands[band_count] = .{
+                            .center = center,
+                            .half_width = if (half_w < 0.001) 0.005 else half_w,
+                            .color = hover_color,
+                        };
+                        const name_len = @min(entry.name.len, 16);
+                        @memcpy(channel_bands[band_count].label[0..name_len], entry.name[0..name_len]);
+                        channel_bands[band_count].label_len = @intCast(name_len);
+                        band_count += 1;
                     }
 
                     const plot_result = plot.render(
@@ -725,6 +853,7 @@ pub fn main() !void {
                         channel_bands[0..band_count],
                     );
                     analyzer.refit_x = false;
+                    last_plot_limits = plot_result.limits;
                     analyzer.updateZoomState(plot_result.limits.x_min, plot_result.limits.x_max);
 
                     if (plot_result.drag_line_moved) {

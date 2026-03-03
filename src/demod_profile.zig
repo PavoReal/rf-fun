@@ -1,4 +1,4 @@
-pub const DemodMethod = enum { discriminator, envelope };
+pub const DemodMethod = enum { discriminator, envelope, product };
 
 pub const Stage1CutoffMode = enum { proportional, fixed, nfm_adaptive };
 
@@ -19,6 +19,7 @@ pub const DemodProfile = struct {
     pilot_notch_freq: f32,
     has_tone_detection: bool,
     uses_dc_block: bool,
+    product_offset_hz: f32,
 };
 
 pub const fm_profile = DemodProfile{
@@ -38,6 +39,7 @@ pub const fm_profile = DemodProfile{
     .pilot_notch_freq = 19000.0,
     .has_tone_detection = false,
     .uses_dc_block = false,
+    .product_offset_hz = 0.0,
 };
 
 pub const am_profile = DemodProfile{
@@ -57,6 +59,7 @@ pub const am_profile = DemodProfile{
     .pilot_notch_freq = 0.0,
     .has_tone_detection = false,
     .uses_dc_block = true,
+    .product_offset_hz = 0.0,
 };
 
 pub const nfm_profile = DemodProfile{
@@ -76,6 +79,107 @@ pub const nfm_profile = DemodProfile{
     .pilot_notch_freq = 0.0,
     .has_tone_detection = true,
     .uses_dc_block = false,
+    .product_offset_hz = 0.0,
 };
 
-pub const combo_labels: [:0]const u8 = "FM\x00AM\x00NFM\x00";
+pub const usb_profile = DemodProfile{
+    .name = "Upper Sideband",
+    .short_name = "USB",
+    .intermediate_rate = 24_000.0,
+    .audio_rate = 24_000.0,
+    .stage2_decimation = 1,
+    .demod_method = .product,
+    .stage1_cutoff_mode = .fixed,
+    .stage1_cutoff_value = 3000.0,
+    .max_deviation = 1.0,
+    .has_deemphasis = false,
+    .default_tau = 0.0,
+    .has_agc = true,
+    .has_pilot_notch = false,
+    .pilot_notch_freq = 0.0,
+    .has_tone_detection = false,
+    .uses_dc_block = true,
+    .product_offset_hz = 0.0,
+};
+
+pub const lsb_profile = DemodProfile{
+    .name = "Lower Sideband",
+    .short_name = "LSB",
+    .intermediate_rate = 24_000.0,
+    .audio_rate = 24_000.0,
+    .stage2_decimation = 1,
+    .demod_method = .product,
+    .stage1_cutoff_mode = .fixed,
+    .stage1_cutoff_value = 3000.0,
+    .max_deviation = 1.0,
+    .has_deemphasis = false,
+    .default_tau = 0.0,
+    .has_agc = true,
+    .has_pilot_notch = false,
+    .pilot_notch_freq = 0.0,
+    .has_tone_detection = false,
+    .uses_dc_block = true,
+    .product_offset_hz = 0.0,
+};
+
+pub const dsb_profile = DemodProfile{
+    .name = "Double Sideband",
+    .short_name = "DSB",
+    .intermediate_rate = 24_000.0,
+    .audio_rate = 24_000.0,
+    .stage2_decimation = 1,
+    .demod_method = .product,
+    .stage1_cutoff_mode = .fixed,
+    .stage1_cutoff_value = 4600.0,
+    .max_deviation = 1.0,
+    .has_deemphasis = false,
+    .default_tau = 0.0,
+    .has_agc = true,
+    .has_pilot_notch = false,
+    .pilot_notch_freq = 0.0,
+    .has_tone_detection = false,
+    .uses_dc_block = true,
+    .product_offset_hz = 0.0,
+};
+
+pub const cw_profile = DemodProfile{
+    .name = "Continuous Wave",
+    .short_name = "CW",
+    .intermediate_rate = 24_000.0,
+    .audio_rate = 3_000.0,
+    .stage2_decimation = 8,
+    .demod_method = .product,
+    .stage1_cutoff_mode = .fixed,
+    .stage1_cutoff_value = 3000.0,
+    .max_deviation = 1.0,
+    .has_deemphasis = false,
+    .default_tau = 0.0,
+    .has_agc = true,
+    .has_pilot_notch = false,
+    .pilot_notch_freq = 0.0,
+    .has_tone_detection = false,
+    .uses_dc_block = false,
+    .product_offset_hz = 800.0,
+};
+
+pub const raw_profile = DemodProfile{
+    .name = "RAW IQ",
+    .short_name = "RAW",
+    .intermediate_rate = 48_000.0,
+    .audio_rate = 48_000.0,
+    .stage2_decimation = 1,
+    .demod_method = .product,
+    .stage1_cutoff_mode = .fixed,
+    .stage1_cutoff_value = 24000.0,
+    .max_deviation = 1.0,
+    .has_deemphasis = false,
+    .default_tau = 0.0,
+    .has_agc = false,
+    .has_pilot_notch = false,
+    .pilot_notch_freq = 0.0,
+    .has_tone_detection = false,
+    .uses_dc_block = false,
+    .product_offset_hz = 0.0,
+};
+
+pub const combo_labels: [:0]const u8 = "FM\x00AM\x00NFM\x00USB\x00LSB\x00DSB\x00CW\x00RAW\x00";

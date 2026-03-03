@@ -31,6 +31,7 @@ pub const ChannelManager = struct {
     const Self = @This();
 
     channels: [MAX_CHANNELS]?Channel = [_]?Channel{null} ** MAX_CHANNELS,
+    channels_mutex: std.Thread.Mutex = .{},
     active_count: u8 = 0,
     alloc: std.mem.Allocator,
 
@@ -87,6 +88,12 @@ pub const ChannelManager = struct {
     }
 
     pub fn addChannel(self: *Self, config: ChannelConfig) !u8 {
+        self.channels_mutex.lock();
+        defer self.channels_mutex.unlock();
+        return self.addChannelLocked(config);
+    }
+
+    fn addChannelLocked(self: *Self, config: ChannelConfig) !u8 {
         for (&self.channels, 0..) |*slot, i| {
             if (slot.* == null) {
                 slot.* = try Channel.init(self.alloc, config, self.sample_rate, self.center_freq_mhz);
@@ -98,6 +105,8 @@ pub const ChannelManager = struct {
     }
 
     pub fn removeChannel(self: *Self, index: u8) void {
+        self.channels_mutex.lock();
+        defer self.channels_mutex.unlock();
         if (index >= MAX_CHANNELS) return;
         if (self.channels[index]) |*ch| {
             ch.deinit();
@@ -107,6 +116,8 @@ pub const ChannelManager = struct {
     }
 
     pub fn setGlobalSquelch(self: *Self, db: f32) void {
+        self.channels_mutex.lock();
+        defer self.channels_mutex.unlock();
         self.global_squelch_db = db;
         for (&self.channels) |*slot| {
             if (slot.*) |*ch| {
@@ -117,6 +128,12 @@ pub const ChannelManager = struct {
     }
 
     pub fn removeAllChannels(self: *Self) void {
+        self.channels_mutex.lock();
+        defer self.channels_mutex.unlock();
+        self.removeAllChannelsLocked();
+    }
+
+    fn removeAllChannelsLocked(self: *Self) void {
         for (&self.channels) |*slot| {
             if (slot.*) |*ch| {
                 ch.deinit();
@@ -127,7 +144,10 @@ pub const ChannelManager = struct {
     }
 
     pub fn loadPreset(self: *Self, preset_index: usize) !void {
-        self.removeAllChannels();
+        self.channels_mutex.lock();
+        defer self.channels_mutex.unlock();
+
+        self.removeAllChannelsLocked();
         if (preset_index >= presets.preset_tables.len) return;
         const table = presets.preset_tables[preset_index];
 
@@ -140,7 +160,7 @@ pub const ChannelManager = struct {
             var label_buf: [16]u8 = undefined;
             const label_text = std.fmt.bufPrint(&label_buf, "Ch {d}", .{pch.number}) catch "Ch";
             config.setLabel(label_text);
-            _ = try self.addChannel(config);
+            _ = try self.addChannelLocked(config);
         }
     }
 
@@ -162,6 +182,8 @@ pub const ChannelManager = struct {
     }
 
     pub fn updateFreqs(self: *Self, center_freq_mhz: f32, sample_rate: f64) void {
+        self.channels_mutex.lock();
+        defer self.channels_mutex.unlock();
         self.center_freq_mhz = center_freq_mhz;
         self.sample_rate = sample_rate;
         for (&self.channels) |*slot| {
@@ -261,6 +283,8 @@ pub const ChannelManager = struct {
 
             const iq_slice = self.input_buf[0..copied];
 
+            self.channels_mutex.lock();
+
             var any_solo = false;
             for (&self.channels) |*slot| {
                 if (slot.*) |*ch| {
@@ -291,6 +315,8 @@ pub const ChannelManager = struct {
 
             const t3: u64 = @intCast(std.time.nanoTimestamp());
             timing_ema.update(.mix, t3 - t2);
+
+            self.channels_mutex.unlock();
 
             timing_ema.updateTotal(t3 - t0);
             timing_ema.finalize();

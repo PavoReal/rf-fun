@@ -15,6 +15,7 @@ pub const ChannelConfig = struct {
     label_len: u8 = 0,
     nfm_dev: f32 = 5_000.0,
     tau: f32 = 75e-6,
+    cw_tone: f32 = 800.0,
 
     pub fn labelSlice(self: *const ChannelConfig) []const u8 {
         return self.label[0..self.label_len];
@@ -49,6 +50,7 @@ pub const Channel = struct {
             config.tau,
             config.modulation,
             config.nfm_dev,
+            config.cw_tone,
         );
         worker.audio_stream = null;
         worker.squelch_threshold = config.squelch_db;
@@ -103,6 +105,7 @@ pub const Channel = struct {
             self.config.tau,
             self.config.modulation,
             self.config.nfm_dev,
+            self.config.cw_tone,
         );
         self.worker.squelch_threshold = self.config.squelch_db;
 
@@ -146,6 +149,8 @@ pub const Channel = struct {
         if (raw < 0) return;
         const mod: ModulationType = @enumFromInt(@as(u8, @intCast(raw)));
         self.config.modulation = mod;
-        self.reconfigure(sample_rate, center_freq_mhz) catch {};
+        self.reconfigure(sample_rate, center_freq_mhz) catch {
+            self.config.modulation = self.worker.modulation;
+        };
     }
 };

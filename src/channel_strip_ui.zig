@@ -101,6 +101,9 @@ pub const ChannelStripUi = struct {
             zgui.tableSetupColumn("Squelch", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 100 });
             zgui.tableHeadersRow();
 
+            mgr.channels_mutex.lock();
+            defer mgr.channels_mutex.unlock();
+
             for (&mgr.channels, 0..) |*slot, i| {
                 const ch = &(slot.* orelse continue);
 

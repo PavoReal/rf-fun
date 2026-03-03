@@ -15,7 +15,7 @@ const rx_buf_size_labels: [:0]const u8 =
     "16 MB (8M)\x0032 MB (16M)\x0064 MB (32M)\x00128 MB (64M)\x00" ++
     "256 MB (128M)\x00512 MB (256M)\x001 GB (512M)\x00";
 
-const bb_filter_values = [_]u32{
+pub const bb_filter_values = [_]u32{
     1750000,  2500000,  3500000,  5000000,
     5500000,  6000000,  7000000,  8000000,
     9000000,  10000000, 12000000, 14000000,
@@ -154,20 +154,6 @@ pub const HackRFConfig = struct {
     }
 
     fn renderHackRFTab(self: *HackRFConfig, device: ?hackrf.Device) void {
-        if (device != null) {
-            if (zgui.button("Disconnect", .{})) {
-                self.disconnect_requested = true;
-            }
-        } else {
-            if (zgui.button("Connect", .{})) {
-                self.connect_requested = true;
-            }
-        }
-
-        if (self.connect_error_msg) |msg| {
-            zgui.textColored(.{ 0.9, 0.1, 0.1, 1 }, "Error: {s}", .{msg});
-        }
-
         if (self.version_len > 0) {
             zgui.text("Firmware: {s}", .{self.version_str[0..self.version_len]});
         }
@@ -207,13 +193,6 @@ pub const HackRFConfig = struct {
         if (disabled) zgui.beginDisabled(.{});
 
         zgui.separatorText("RF Configuration");
-
-        if (zgui.sliderFloat("Center Freq (MHz)", .{ .v = &self.cf_mhz, .min = 1.0, .max = 6000.0 })) {
-            self.freq_changed = true;
-            if (device) |dev| {
-                dev.setFreq(self.cfHz()) catch {};
-            }
-        }
 
         if (zgui.combo("Sample Rate", .{
             .current_item = &self.sample_rate_index,

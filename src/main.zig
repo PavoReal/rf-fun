@@ -190,8 +190,8 @@ const WaterfallGpu = struct {
         self.texture = c.SDL_CreateGPUTexture(self.gpu_device, &tex_info);
 
         const sampler_info = c.SDL_GPUSamplerCreateInfo{
-            .min_filter = c.SDL_GPU_FILTER_NEAREST,
-            .mag_filter = c.SDL_GPU_FILTER_NEAREST,
+            .min_filter = c.SDL_GPU_FILTER_LINEAR,
+            .mag_filter = c.SDL_GPU_FILTER_LINEAR,
             .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
             .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
@@ -251,10 +251,14 @@ fn buildDefaultDockLayout(dockspace_id: zgui.Ident) void {
     var stats_id: zgui.Ident = undefined;
     _ = zgui.dockBuilderSplitNode(top_id, .left, 0.6, &analysis_id, &stats_id);
 
-    zgui.dockBuilderDockWindow("###HackRF Config", left_id);
-    zgui.dockBuilderDockWindow("###Save", left_id);
-    zgui.dockBuilderDockWindow("###Radio Decoder", left_id);
-    zgui.dockBuilderDockWindow("###Channel Monitor", left_id);
+    var left_top_id: zgui.Ident = undefined;
+    var left_bottom_id: zgui.Ident = undefined;
+    _ = zgui.dockBuilderSplitNode(left_id, .up, 0.53, &left_top_id, &left_bottom_id);
+
+    zgui.dockBuilderDockWindow("###HackRF Config", left_top_id);
+    zgui.dockBuilderDockWindow("###Save", left_top_id);
+    zgui.dockBuilderDockWindow("###Radio Decoder", left_bottom_id);
+    zgui.dockBuilderDockWindow("###Channel Monitor", left_bottom_id);
     zgui.dockBuilderDockWindow("###Analysis", analysis_id);
     zgui.dockBuilderDockWindow("###Stats", stats_id);
     zgui.dockBuilderDockWindow("###Data View", bottom_id);
@@ -619,6 +623,17 @@ pub fn main() !void {
                 }
 
                 if (zgui.begin("FFT###Data View", .{})) {
+                    if (analyzer.user_zoomed) {
+                        const span = analyzer.zoom_x_max - analyzer.zoom_x_min;
+                        zgui.text("{d:.3} - {d:.3} MHz ({d:.3} MHz span)", .{
+                            analyzer.zoom_x_min, analyzer.zoom_x_max, span,
+                        });
+                        zgui.sameLine(.{});
+                        if (zgui.button("Reset Zoom", .{})) {
+                            analyzer.resetZoom();
+                        }
+                    }
+
                     const avail = zgui.getContentRegionAvail();
                     const line_h = avail[1] * 0.35;
                     const wf_h = avail[1] * 0.60;
@@ -710,12 +725,13 @@ pub fn main() !void {
                         channel_bands[0..band_count],
                     );
                     analyzer.refit_x = false;
+                    analyzer.updateZoomState(plot_result.limits.x_min, plot_result.limits.x_max);
 
                     if (plot_result.drag_line_moved) {
                         radio_decoder.setFreqMhz(drag_freq);
                     }
 
-                    if (sdr != null and plot_result.hovered) {
+                    if (sdr != null and plot_result.hovered and !analyzer.user_zoomed) {
                         const plot_center = (plot_result.limits.x_min + plot_result.limits.x_max) / 2.0;
                         const cf_mhz: f64 = @floatCast(config.cf_mhz);
                         const diff = @abs(plot_center - cf_mhz);
@@ -747,7 +763,21 @@ pub fn main() !void {
                         const waterfall_width = plot_result.plot_size[0];
                         zgui.setCursorPosX(plot_left_local);
                         const wf_screen_pos = zgui.getCursorScreenPos();
-                        zgui.image(tex_ref, .{ .w = waterfall_width, .h = wf_h });
+
+                        var wf_uv0 = [2]f32{ 0.0, 0.0 };
+                        var wf_uv1 = [2]f32{ 1.0, 1.0 };
+                        if (analyzer.xRange()) |full| {
+                            const full_span = full[1] - full[0];
+                            if (full_span > 0) {
+                                wf_uv0[0] = std.math.clamp(@as(f32, @floatCast(
+                                    (plot_result.limits.x_min - full[0]) / full_span,
+                                )), 0.0, 1.0);
+                                wf_uv1[0] = std.math.clamp(@as(f32, @floatCast(
+                                    (plot_result.limits.x_max - full[0]) / full_span,
+                                )), 0.0, 1.0);
+                            }
+                        }
+                        zgui.image(tex_ref, .{ .w = waterfall_width, .h = wf_h, .uv0 = wf_uv0, .uv1 = wf_uv1 });
 
                         {
                             const x_range = plot_result.limits.x_max - plot_result.limits.x_min;

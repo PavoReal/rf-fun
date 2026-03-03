@@ -289,6 +289,10 @@ pub const SpectrumAnalyzer = struct {
 
     refit_x: bool,
 
+    user_zoomed: bool,
+    zoom_x_min: f64,
+    zoom_x_max: f64,
+
     waterfall: Waterfall,
     wf_history_len: u32,
 
@@ -352,6 +356,9 @@ pub const SpectrumAnalyzer = struct {
             .cached_peak = cached_peak,
             .has_frame = false,
             .refit_x = true,
+            .user_zoomed = false,
+            .zoom_x_min = 0,
+            .zoom_x_max = 0,
             .waterfall = waterfall,
             .wf_history_len = wf_history,
             .fft_freqs = fft_freqs,
@@ -469,6 +476,7 @@ pub const SpectrumAnalyzer = struct {
 
         computeFreqs(self.fft_freqs, fft_size_values[@intCast(self.fft_size_index)], cf_mhz, fs_hz);
         self.refit_x = true;
+        self.user_zoomed = false;
     }
 
     pub fn resetSmoothing(self: *Self) void {
@@ -484,6 +492,7 @@ pub const SpectrumAnalyzer = struct {
         self.measured_dsp_rate = null;
         self.dsp_frame_count = 0;
         self.last_rate_time_ns = std.time.nanoTimestamp();
+        self.user_zoomed = false;
     }
 
     pub fn dspRate(self: *const Self) ?f32 {
@@ -511,6 +520,22 @@ pub const SpectrumAnalyzer = struct {
             };
         }
         return null;
+    }
+
+    pub fn updateZoomState(self: *Self, limit_x_min: f64, limit_x_max: f64) void {
+        const full = self.xRange() orelse return;
+        const eps = 0.01;
+        self.user_zoomed = (@abs(limit_x_min - full[0]) > eps or
+            @abs(limit_x_max - full[1]) > eps);
+        if (self.user_zoomed) {
+            self.zoom_x_min = limit_x_min;
+            self.zoom_x_max = limit_x_max;
+        }
+    }
+
+    pub fn resetZoom(self: *Self) void {
+        self.user_zoomed = false;
+        self.refit_x = true;
     }
 
     pub fn renderUi(self: *Self, fps: f32, cf_mhz: f32, fs_hz: f64) !UiResult {

@@ -401,7 +401,7 @@ probability by 32%.
 - ["Clean" Code, Horrible Performance](https://www.computerenhance.com/p/clean-code-horrible-performance)
 - [Performance Excuses Debunked](https://www.computerenhance.com/p/performance-excuses-debunked)
 - [The Big OOPs (BSC 2025)](https://www.computerenhance.com/p/the-big-oops-anatomy-of-a-thirty)
-- [Muratori / Uncle Bob Discussion](https://github.com/unclebob/cmuratori-discussion/blob/main/cleancodeqa.md)
+- [Clean Code Discussion](https://github.com/unclebob/cmuratori-discussion/blob/main/cleancodeqa.md)
 - [The Thirty-Million-Line Problem](https://caseymuratori.com/blog_0031)
 - [Computer, Enhance!](https://www.computerenhance.com/)
 - [Handmade Hero](https://hero.handmade.network/)

@@ -41,6 +41,12 @@ non-trivial task:
 5. Document results
 6. Capture lessons
 
+## Code Rules
+- Always reference `code_rules.md` before writing code. It contains the
+  project's coding philosophy derived from Casey Muratori's work. Key
+  principles: compression-oriented programming, write usage code first,
+  non-pessimization, total cost as the only metric, and data-oriented design.
+
 ## Guidelines
 - Use `rg` in place of `grep` whenever possible.
 - Research all APIs. When creating a task plan, if the task involves

@@ -268,6 +268,7 @@ rf-fun/
 ├── build.zig              # Build configuration (links all C deps from source)
 ├── build.zig.zon          # Package manifest and dependency URLs
 ├── CLAUDE.md              # AI assistant instructions
+├── code_rules.md          # Coding philosophy (Casey Muratori)
 ├── LICENSE                # MIT license
 ├── TODO.md                # Human task tracking
 │

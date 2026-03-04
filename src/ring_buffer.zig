@@ -23,6 +23,12 @@ pub fn FixedSizeRingBuffer(comptime T: type) type {
             self.* = undefined;
         }
 
+        pub fn reset(self: *Self) void {
+            self.head = 0;
+            self.count = 0;
+            self.total_written = 0;
+        }
+
         pub fn resize(self: *Self, allocator: Allocator, new_cap: usize) Allocator.Error!void {
             const new_buf = try allocator.alloc(T, new_cap);
             allocator.free(self.buf);

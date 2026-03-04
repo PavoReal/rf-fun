@@ -10,6 +10,9 @@ const FreqWidget = @import("freq_widget.zig").FreqWidget;
 const SpectrumAnalyzer = @import("spectrum_analyzer.zig").SpectrumAnalyzer;
 const signal_stats = @import("signal_stats.zig");
 const SaveManager = @import("save_manager.zig").SaveManager;
+const SampleBuffer = @import("sample_buffer.zig").SampleBuffer;
+const RFSource = @import("rf_source.zig").RFSource;
+const FileSource = @import("file_source.zig").FileSource;
 const stats_window_mod = @import("stats_window.zig");
 const StatsWindow = stats_window_mod.StatsWindow;
 const PipelineInfo = stats_window_mod.PipelineInfo;
@@ -38,11 +41,11 @@ fn lookupErrMsg(err: anyerror) []const u8 {
 }
 
 fn sdrRxCallback(trans: hackrf.Transfer, state: *SDR) hackrf.StreamAction {
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    state.sample_buf.mutex.lock();
+    defer state.sample_buf.mutex.unlock();
 
-    state.rx_bytes_received += trans.validLength();
-    state.rx_buffer.append(trans.iqSamples());
+    state.sample_buf.bytes_received += trans.validLength();
+    state.sample_buf.rx_buffer.append(trans.iqSamples());
 
     if (!state.rx_running) return .stop;
     return .@"continue";
@@ -52,16 +55,11 @@ const SDR = struct {
     const Self = @This();
 
     device: hackrf.Device = undefined,
-
-    mutex: std.Thread.Mutex = .{},
-
     rx_running: bool = false,
-    rx_bytes_received: u64 = 0,
+    sample_buf: *SampleBuffer,
 
-    rx_buffer: FixedSizeRingBuffer(hackrf.IQSample) = undefined,
-
-    pub fn init(alloc: std.mem.Allocator, rx_buf_samples: usize) !Self {
-        var self = Self{};
+    pub fn init(sample_buf: *SampleBuffer) !Self {
+        var self = Self{ .sample_buf = sample_buf };
         try hackrf.init();
 
         var list = try hackrf.DeviceList.get();
@@ -72,20 +70,7 @@ const SDR = struct {
         self.device = try hackrf.Device.open();
         self.device.stopTx() catch {};
 
-        self.rx_buffer = try FixedSizeRingBuffer(hackrf.IQSample).init(alloc, rx_buf_samples);
-
         return self;
-    }
-
-    pub fn resizeBuffer(self: *Self, alloc: std.mem.Allocator, new_count: usize) !void {
-        const new_buf = try alloc.alloc(hackrf.IQSample, new_count);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        alloc.free(self.rx_buffer.buf);
-        self.rx_buffer.buf = new_buf;
-        self.rx_buffer.head = 0;
-        self.rx_buffer.count = 0;
-        self.rx_bytes_received = 0;
     }
 
     pub fn startRx(self: *Self) !void {
@@ -93,7 +78,7 @@ const SDR = struct {
         try self.device.startRx(*Self, sdrRxCallback, self);
     }
 
-    pub fn deinit(self: *Self, alloc: std.mem.Allocator) !void {
+    pub fn deinit(self: *Self) !void {
         self.rx_running = false;
 
         var timeout: u32 = 0;
@@ -101,7 +86,6 @@ const SDR = struct {
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
 
-        self.rx_buffer.deinit(alloc);
         self.device.close();
         try hackrf.deinit();
     }
@@ -317,6 +301,7 @@ pub fn main() !void {
     const alloc = allocator.allocator();
 
     var sdr: ?SDR = null;
+    var consumers_running: bool = false;
     var show_no_device_popup: bool = false;
 
     try zsdl.init(.{ .video = true, .events = true, .audio = true });
@@ -369,6 +354,13 @@ pub fn main() !void {
     var config: HackRFConfig = .{};
     config.load();
     defer config.save();
+
+    var sample_buf = try SampleBuffer.init(alloc, config.rxBufSamples());
+    defer sample_buf.deinit(alloc);
+
+    var rf_source: RFSource = .{
+        .file_source = .{ .sample_buf = &sample_buf },
+    };
 
     var freq_widget = FreqWidget.init(config.cf_mhz, large_font);
 
@@ -451,7 +443,7 @@ pub fn main() !void {
             }
         }
 
-        if (sdr != null) {
+        if (consumers_running) {
             _ = analyzer.pollFrame();
         }
 
@@ -524,11 +516,11 @@ pub fn main() !void {
             }
 
             {
-                config.render(if (sdr != null) sdr.?.device else null);
+                rf_source.render(&config, if (sdr != null) sdr.?.device else null, @ptrCast(window));
 
                 save_mgr.render(
-                    if (sdr != null) &sdr.?.mutex else null,
-                    if (sdr != null) &sdr.?.rx_buffer else null,
+                    &sample_buf,
+                    consumers_running,
                     &config,
                     alloc,
                     @ptrCast(window),
@@ -538,7 +530,7 @@ pub fn main() !void {
                     config.connect_requested = false;
                     config.connect_error_msg = null;
 
-                    sdr = SDR.init(alloc, config.rxBufSamples()) catch |err| blk: {
+                    sdr = SDR.init(&sample_buf) catch |err| blk: {
                         config.connect_error_msg = lookupErrMsg(err);
                         break :blk null;
                     };
@@ -557,9 +549,10 @@ pub fn main() !void {
                         radio_decoder.updateFreqs(config.cf_mhz, config.fsHz());
                         channel_mgr.updateFreqs(config.cf_mhz, config.fsHz());
                         try sdr.?.startRx();
-                        try analyzer.startThread(&sdr.?.mutex, &sdr.?.rx_buffer);
-                        try radio_decoder.start(&sdr.?.mutex, &sdr.?.rx_buffer);
-                        try channel_mgr.start(&sdr.?.mutex, &sdr.?.rx_buffer);
+                        try analyzer.startThread(&sample_buf.mutex, &sample_buf.rx_buffer);
+                        try radio_decoder.start(&sample_buf.mutex, &sample_buf.rx_buffer);
+                        try channel_mgr.start(&sample_buf.mutex, &sample_buf.rx_buffer);
+                        consumers_running = true;
                     }
                 }
 
@@ -592,9 +585,11 @@ pub fn main() !void {
                     channel_mgr.stop();
                     radio_decoder.stop();
                     analyzer.stopThread();
+                    consumers_running = false;
                     sdr.?.rx_running = false;
-                    try sdr.?.deinit(alloc);
+                    try sdr.?.deinit();
                     sdr = null;
+                    sample_buf.reset();
                     config.clearDeviceInfo();
                     config.connect_error_msg = null;
                     analyzer.resetAll();
@@ -641,9 +636,51 @@ pub fn main() !void {
 
                 if (config.rx_buf_size_changed) {
                     config.rx_buf_size_changed = false;
-                    if (sdr != null) {
-                        sdr.?.resizeBuffer(alloc, config.rxBufSamples()) catch {};
+                    sample_buf.resizeBuffer(alloc, config.rxBufSamples()) catch {};
+                }
+
+                if (rf_source.source_changed) {
+                    rf_source.source_changed = false;
+                    if (consumers_running) {
+                        rf_source.file_source.stop();
+                        channel_mgr.stop();
+                        radio_decoder.stop();
+                        analyzer.stopThread();
+                        consumers_running = false;
                     }
+                    if (sdr != null) {
+                        sdr.?.rx_running = false;
+                        try sdr.?.deinit();
+                        sdr = null;
+                        config.clearDeviceInfo();
+                    }
+                    sample_buf.reset();
+                    analyzer.resetAll();
+                }
+
+                if (rf_source.play_requested) {
+                    rf_source.play_requested = false;
+                    config.cf_mhz = rf_source.file_source.center_freq_mhz;
+                    const file_sr: f64 = @floatFromInt(rf_source.file_source.sample_rate);
+                    analyzer.updateFreqs(config.cf_mhz, file_sr);
+                    radio_decoder.updateFreqs(config.cf_mhz, file_sr);
+                    channel_mgr.updateFreqs(config.cf_mhz, file_sr);
+                    try rf_source.file_source.play();
+                    try analyzer.startThread(&sample_buf.mutex, &sample_buf.rx_buffer);
+                    try radio_decoder.start(&sample_buf.mutex, &sample_buf.rx_buffer);
+                    try channel_mgr.start(&sample_buf.mutex, &sample_buf.rx_buffer);
+                    consumers_running = true;
+                }
+
+                if (rf_source.stop_requested) {
+                    rf_source.stop_requested = false;
+                    rf_source.file_source.stop();
+                    channel_mgr.stop();
+                    radio_decoder.stop();
+                    analyzer.stopThread();
+                    consumers_running = false;
+                    sample_buf.reset();
+                    analyzer.resetAll();
                 }
 
                 radio_decoder.renderUi();
@@ -679,14 +716,14 @@ pub fn main() !void {
                     },
                 };
 
-                const buf_snap: BufferSnapshot = if (sdr != null) blk: {
-                    sdr.?.mutex.lock();
-                    defer sdr.?.mutex.unlock();
+                const buf_snap: BufferSnapshot = if (consumers_running) blk: {
+                    sample_buf.mutex.lock();
+                    defer sample_buf.mutex.unlock();
                     break :blk .{
-                        .count = sdr.?.rx_buffer.count,
-                        .capacity = sdr.?.rx_buffer.buf.len,
-                        .total_written = sdr.?.rx_buffer.total_written,
-                        .rx_bytes = sdr.?.rx_bytes_received,
+                        .count = sample_buf.rx_buffer.count,
+                        .capacity = sample_buf.rx_buffer.buf.len,
+                        .total_written = sample_buf.rx_buffer.total_written,
+                        .rx_bytes = sample_buf.bytes_received,
                     };
                 } else .{};
 
@@ -707,8 +744,8 @@ pub fn main() !void {
                 const ui_result = try analyzer.renderUi(zgui.io.getFramerate(), config.cf_mhz, config.fsHz());
                 if (ui_result.resized) {
                     wf_gpu.resize(ui_result.new_fft_size, 256);
-                    if (sdr != null) {
-                        try analyzer.startThread(&sdr.?.mutex, &sdr.?.rx_buffer);
+                    if (consumers_running) {
+                        try analyzer.startThread(&sample_buf.mutex, &sample_buf.rx_buffer);
                     }
                 }
 
@@ -860,7 +897,7 @@ pub fn main() !void {
                         radio_decoder.setFreqMhz(drag_freq);
                     }
 
-                    if (sdr != null and plot_result.hovered and !analyzer.user_zoomed) {
+                    if (sdr != null and consumers_running and plot_result.hovered and !analyzer.user_zoomed) {
                         const plot_center = (plot_result.limits.x_min + plot_result.limits.x_max) / 2.0;
                         const cf_mhz: f64 = @floatCast(config.cf_mhz);
                         const diff = @abs(plot_center - cf_mhz);
@@ -978,11 +1015,14 @@ pub fn main() !void {
         }
     }
 
-    if (sdr != null) {
+    rf_source.file_source.stop();
+    if (consumers_running) {
         channel_mgr.stop();
         radio_decoder.stop();
         analyzer.stopThread();
+    }
+    if (sdr != null) {
         sdr.?.rx_running = false;
-        try sdr.?.deinit(alloc);
+        try sdr.?.deinit();
     }
 }

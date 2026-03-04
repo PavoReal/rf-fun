@@ -3,6 +3,7 @@ const hackrf = @import("rf_fun");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 const wav_writer = @import("wav_writer.zig");
 const HackRFConfig = @import("hackrf_config.zig").HackRFConfig;
+const SampleBuffer = @import("sample_buffer.zig").SampleBuffer;
 const zgui = @import("zgui");
 const c = @cImport({
     @cInclude("SDL3/SDL.h");
@@ -41,7 +42,7 @@ pub const SaveManager = struct {
         self.dialog_pending.store(false, .release);
     }
 
-    pub fn render(self: *Self, sdr_mutex: ?*std.Thread.Mutex, rx_buffer: ?*FixedSizeRingBuffer(hackrf.IQSample), config: *const HackRFConfig, alloc: std.mem.Allocator, sdl_window: *c.SDL_Window) void {
+    pub fn render(self: *Self, sample_buf: *SampleBuffer, consumers_running: bool, config: *const HackRFConfig, alloc: std.mem.Allocator, sdl_window: *c.SDL_Window) void {
         if (!zgui.begin("Save###Save", .{})) {
             zgui.end();
             return;
@@ -83,9 +84,8 @@ pub const SaveManager = struct {
         });
 
         // Buffer info
-        const has_sdr = rx_buffer != null;
-        if (has_sdr) {
-            const sample_count = rx_buffer.?.len();
+        if (consumers_running) {
+            const sample_count = sample_buf.rx_buffer.len();
             const bps: usize = if (self.bits_per_sample_index == 0) 8 else 16;
             const est_bytes = sample_count * 2 * (bps / 8);
             zgui.text("Samples: {d} | Est. size: {d:.1} MB", .{
@@ -93,18 +93,18 @@ pub const SaveManager = struct {
                 @as(f64, @floatFromInt(est_bytes)) / (1024.0 * 1024.0),
             });
         } else {
-            zgui.textDisabled("No device connected", .{});
+            zgui.textDisabled("No source active", .{});
         }
 
         // Save button
         {
-            const empty_buffer = if (rx_buffer) |rb| rb.len() == 0 else true;
-            const save_disabled = !has_sdr or self.path_len == 0 or
+            const empty_buffer = sample_buf.rx_buffer.len() == 0;
+            const save_disabled = !consumers_running or self.path_len == 0 or
                 self.dialog_pending.load(.acquire) or
                 self.status == .saving or empty_buffer;
             if (save_disabled) zgui.beginDisabled(.{});
             if (zgui.button("Save", .{})) {
-                self.save(sdr_mutex.?, rx_buffer.?, config, alloc);
+                self.save(&sample_buf.mutex, &sample_buf.rx_buffer, config, alloc);
             }
             if (save_disabled) zgui.endDisabled();
         }

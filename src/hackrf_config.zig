@@ -153,7 +153,7 @@ pub const HackRFConfig = struct {
         }
     }
 
-    fn renderHackRFTab(self: *HackRFConfig, device: ?hackrf.Device) void {
+    pub fn renderHackRFTab(self: *HackRFConfig, device: ?hackrf.Device) void {
         if (self.version_len > 0) {
             zgui.text("Firmware: {s}", .{self.version_str[0..self.version_len]});
         }
@@ -364,7 +364,7 @@ pub const HackRFConfig = struct {
         }
     }
 
-    fn renderGuiTab(self: *HackRFConfig) void {
+    pub fn renderGuiTab(self: *HackRFConfig) void {
         zgui.separatorText("Theme");
 
         if (zgui.combo("Theme", .{
